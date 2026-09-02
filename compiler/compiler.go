@@ -159,7 +159,8 @@ func (b *Builder) ChanNew() { b.emit(bytecode.OpChanNew) }
 func (b *Builder) ChanPut() { b.emit(bytecode.OpChanPut) }
 func (b *Builder) ChanGet() { b.emit(bytecode.OpChanGet) }
 
-func (b *Builder) SystemExec() { b.emit(bytecode.OpSystemExec) }
+func (b *Builder) SystemExec()     { b.emit(bytecode.OpSystemExec) }
+func (b *Builder) SystemReadFile() { b.emit(bytecode.OpSystemReadFile) }
 
 // ===== 容器指令 =====
 func (b *Builder) ListNew()      { b.emit(bytecode.OpListNew) }
@@ -244,6 +245,11 @@ func (b *Builder) emitJumpTo(op bytecode.Op, name string) {
 func (b *Builder) JmpTo(name string) { b.emitJumpTo(bytecode.OpJmp, name) }
 func (b *Builder) JzTo(name string)  { b.emitJumpTo(bytecode.OpJz, name) }
 func (b *Builder) JnzTo(name string) { b.emitJumpTo(bytecode.OpJnz, name) }
+
+// 异常处理：PushHandlerTo 支持前向标签回填（布局 [op][i32] 与跳转一致）
+func (b *Builder) PushHandlerTo(name string) { b.emitJumpTo(bytecode.OpPushHandler, name) }
+func (b *Builder) PopHandler()               { b.emit(bytecode.OpPopHandler) }
+func (b *Builder) Raise()                    { b.emit(bytecode.OpRaise) }
 
 func (b *Builder) SetMethodBlockStart(off uint32) { b.methodBlockStart = off }
 func (b *Builder) MethodBlockStart() uint32       { return b.methodBlockStart }
@@ -832,7 +838,11 @@ func (c *Compiler) compileStmt(n *ast.Node) {
 		c.compileAssign(n)
 	case ast.NAugAssign:
 		c.compileAugAssign(n)
-	case ast.NGlobal, ast.NNonlocal, ast.NTry, ast.NRaise, ast.NWith,
+	case ast.NTry:
+		c.compileTry(n)
+	case ast.NRaise:
+		c.compileRaise(n)
+	case ast.NGlobal, ast.NNonlocal, ast.NWith,
 		ast.NImport, ast.NClass, ast.NInterface, ast.NMethod:
 		// 已在更外层处理，或暂未实现
 	default:
@@ -867,6 +877,130 @@ func (c *Compiler) compileGoStmt(n *ast.Node) {
 	c.builder.PushI64(int64(midx))
 	c.builder.Go()
 	// go 语句无返回值，不压占位（compileStmt 的 NGo 分支不做语句尾 Pop）
+}
+
+// compileRaise 编译 raise 语句：
+//
+//	raise "msg";    → [msg_str_idx] OpRaise
+//	raise;          → [空串] OpRaise
+func (c *Compiler) compileRaise(n *ast.Node) {
+	if len(n.Children) >= 1 && n.Children[0] != nil {
+		c.compileExpr(n.Children[0])
+	} else {
+		c.builder.PushI64(0) // 空串 str_idx
+	}
+	c.builder.Raise()
+}
+
+// compileTry 编译 try/except/finally。
+//
+// 异常模型：异常 = 消息字符串（str_idx 压栈传给 handler）。
+// except 不区分类型——第一个 except 捕获全部异常（其余 except 不可达，告警）；
+// finally 在正常路径与异常路径各内联一份，异常路径执行完后重抛给外层。
+//
+// 生成布局（hasFinally 时）：
+//
+//	PushHandler H1          // H1 = 首个 except；无 except 则 = FE
+//	<try body>
+//	PopHandler
+//	Jmp FN                  // 正常路径 → finally
+//	H1:                     // 进入时栈顶 = msg str_idx
+//	  [PushHandler FE]      // except 体内再抛异常时由 finally 兜底
+//	  StoreLocal e | Pop    // as 名绑定消息 / 丢弃
+//	  <except body>
+//	  [PopHandler; Jmp FN]
+//	FE:                     // 异常路径 finally（栈顶 = msg）
+//	  StoreLocal $fin_exc   // 暂存消息到隐藏局部
+//	  <finally body>        // 副本 1
+//	  LoadLocal $fin_exc
+//	  Raise                 // 重抛（本层 handler 已弹出 → 向外层传播）
+//	FN:
+//	  <finally body>        // 副本 2
+//	  Jmp END
+//	END:
+func (c *Compiler) compileTry(n *ast.Node) {
+	tryBlock := nth(n, 0)
+	var excepts []*ast.Node // NBlock（Text=类型名, Children=[asName?, body]）
+	var finallyBlock *ast.Node
+	for i := 1; i < len(n.Children); i++ {
+		ch := n.Children[i]
+		if ch == nil {
+			continue
+		}
+		if ch.Kind == ast.NFinally {
+			finallyBlock = nth(ch, 0)
+		} else {
+			excepts = append(excepts, ch)
+		}
+	}
+	if len(excepts) == 0 && finallyBlock == nil {
+		// 裸 try：无保护语义，直接展开
+		c.compileStmt(tryBlock)
+		return
+	}
+	if len(excepts) > 1 {
+		c.warnf("only the first except is reachable (exceptions carry no type info)")
+	}
+
+	hasFinally := finallyBlock != nil
+	h1Label := freshLabel("except")
+	endLabel := freshLabel("try_end")
+	finLabel := freshLabel("fin")
+	finExcLabel := freshLabel("fin_exc")
+	// 保护目标：有 except → 第一个 except；仅 finally → finally 异常路径
+	guardLabel := h1Label
+	if len(excepts) == 0 {
+		guardLabel = finExcLabel
+	}
+
+	// try 体
+	c.builder.PushHandlerTo(guardLabel)
+	c.compileStmt(tryBlock)
+	c.builder.PopHandler()
+	if hasFinally {
+		c.builder.JmpTo(finLabel)
+	} else {
+		c.builder.JmpTo(endLabel)
+	}
+
+	// except handler（第一个）
+	if len(excepts) > 0 {
+		c.builder.Label(h1Label)
+		if hasFinally {
+			c.builder.PushHandlerTo(finExcLabel)
+		}
+		exc := excepts[0]
+		excBody := exc.Children[len(exc.Children)-1]
+		// except NAME as e：绑定消息到 e；无名/无 as：丢弃消息
+		if len(exc.Children) >= 2 && exc.Children[0] != nil && exc.Children[0].Kind == ast.NName {
+			slot := c.localSlot(exc.Children[0].Text)
+			c.builder.StoreLocal(slot)
+		} else {
+			c.builder.Pop()
+		}
+		c.compileStmt(excBody)
+		if hasFinally {
+			c.builder.PopHandler()
+			c.builder.JmpTo(finLabel)
+		} else {
+			c.builder.JmpTo(endLabel)
+		}
+	}
+
+	if hasFinally {
+		// 异常路径 finally：暂存消息 → 执行 → 重抛
+		hidden := c.localSlot("$finally_exc")
+		c.builder.Label(finExcLabel)
+		c.builder.StoreLocal(hidden)
+		c.compileStmt(finallyBlock)
+		c.builder.LoadLocal(hidden)
+		c.builder.Raise()
+		// 正常路径 finally
+		c.builder.Label(finLabel)
+		c.compileStmt(finallyBlock)
+		c.builder.JmpTo(endLabel)
+	}
+	c.builder.Label(endLabel)
 }
 
 func (c *Compiler) compileIf(n *ast.Node) {
@@ -1443,6 +1577,23 @@ func (c *Compiler) tryCompileBuiltin(name string, args []*ast.Node) bool {
 		}
 		c.compileExpr(args[0])
 		c.builder.SystemExec()
+		return true
+	case "system.read_file":
+		// 读取文本文件：system.read_file(path) → [list_id]
+		// list[0]=content_str_idx，list[1]=ok(0/1)（与 http.request 双值封装风格一致）
+		if len(args) < 1 {
+			c.builder.PushI64(0)
+			c.builder.PushI64(0)
+		} else {
+			c.compileExpr(args[0])
+			c.builder.SystemReadFile()
+		}
+		// 栈：[ok, content_idx] → 封装成 list
+		c.builder.ListNew()
+		c.builder.Swap()
+		c.builder.ListPush()
+		c.builder.Swap()
+		c.builder.ListPush()
 		return true
 	case "str.new", "str_new":
 		c.builder.StrNew()

@@ -38,6 +38,7 @@ const (
 	StatusUnsupported
 	StatusIO
 	StatusInvalidArgc
+	StatusUncaught
 )
 
 var statusNames = map[Status]string{
@@ -52,6 +53,7 @@ var statusNames = map[Status]string{
 	StatusUnsupported:     "unsupported",
 	StatusIO:              "io error",
 	StatusInvalidArgc:     "invalid argc",
+	StatusUncaught:        "uncaught exception",
 }
 
 func (s Status) String() string {
@@ -380,6 +382,8 @@ type Interpreter struct {
 	Shared *Shared
 	prog   *bytecode.Program
 	isRoot bool // 根线程在结束时等待所有 go 子线程
+	// 异常处理：handler 栈（try 进入时压入，正常结束/Ret 弹出）
+	handlers []handlerFrame
 }
 
 // Chan —— 跨线程缓冲通道（Go 风格；满发送阻塞 / 空接收阻塞）
@@ -460,6 +464,14 @@ func (s *Shared) chanGet(id int64) (int64, bool) {
 type savedFrame struct {
 	saved         [256]int64
 	pendingNewObj int32 // >=0 表示当前帧是构造函数调用，Ret 时用 objID 替换 retval 压栈
+}
+
+// handlerFrame —— try 块进入时的快照（异常处理目标）
+type handlerFrame struct {
+	handlerPC int // 异常时跳转的 handler 起始 pc
+	sp        int // try 进入时的操作数栈深度
+	csLen     int // try 进入时的 callStack 深度
+	framesLen int // try 进入时的 frames 深度（用于 Ret 时判定 handler 归属 / 跨帧恢复）
 }
 
 func NewInterpreter() *Interpreter {
@@ -654,6 +666,10 @@ func (vm *Interpreter) runCode(prog *bytecode.Program, startPC int) (st Status, 
 				return StatusStackUnderflow, err
 			}
 			if b == 0 {
+				if newPC, ok := vm.throwException("division by zero"); ok {
+					pc = newPC
+					break
+				}
 				return StatusDivByZero, fmt.Errorf("divide by zero at pc=%d", pc)
 			}
 			vm.push(a / b)
@@ -667,6 +683,10 @@ func (vm *Interpreter) runCode(prog *bytecode.Program, startPC int) (st Status, 
 				return StatusStackUnderflow, err
 			}
 			if b == 0 {
+				if newPC, ok := vm.throwException("mod by zero"); ok {
+					pc = newPC
+					break
+				}
 				return StatusDivByZero, fmt.Errorf("mod by zero at pc=%d", pc)
 			}
 			vm.push(a % b)
@@ -766,6 +786,11 @@ func (vm *Interpreter) runCode(prog *bytecode.Program, startPC int) (st Status, 
 			vm.callStack = append(vm.callStack, np)
 			pc = np + int(off)
 		case bytecode.OpRet:
+			// 丢弃当前帧及更深帧残留的 handler（return 穿出 try 时的泄漏防护）：
+			// 当前帧的 handler 创建于 len(frames)==D（D=当前帧深度），Ret 时 len(frames)==D
+			for len(vm.handlers) > 0 && vm.handlers[len(vm.handlers)-1].framesLen >= len(vm.frames) {
+				vm.handlers = vm.handlers[:len(vm.handlers)-1]
+			}
 			retVal, err := vm.pop()
 			if err != nil {
 				return StatusStackUnderflow, err
@@ -873,6 +898,29 @@ func (vm *Interpreter) runCode(prog *bytecode.Program, startPC int) (st Status, 
 				}
 			}
 			vm.push(exitCode)
+		case bytecode.OpSystemReadFile:
+			// [path_str_idx] → [ok(0/1), content_str_idx]；软错误（不抛异常）
+			idx, err := vm.pop()
+			if err != nil {
+				return StatusStackUnderflow, err
+			}
+			path := ""
+			if idx > 0 && int(idx) < len(vm.strTable) {
+				path = vm.strTable[idx]
+			}
+			if path == "" {
+				vm.push(0)
+				vm.push(vm.strIntern("read_file: empty path"))
+				break
+			}
+			data, rerr := os.ReadFile(path)
+			if rerr != nil {
+				vm.push(0)
+				vm.push(vm.strIntern(rerr.Error()))
+				break
+			}
+			vm.push(1)
+			vm.push(vm.strIntern(string(data)))
 		// === OOP 操作 ===
 		case bytecode.OpNewObj:
 			st, err := vm.opNewObj(code, &pc)
@@ -985,6 +1033,35 @@ func (vm *Interpreter) runCode(prog *bytecode.Program, startPC int) (st Status, 
 				v = 0
 			}
 			vm.push(v)
+
+		// ===== 异常处理 =====
+		case bytecode.OpPushHandler:
+			off, np, err := readI32(code, pc)
+			if err != nil {
+				return StatusTruncated, err
+			}
+			pc = np
+			vm.handlers = append(vm.handlers, handlerFrame{
+				handlerPC: pc + int(off), // 与 OpCall 一致：相对指令末尾
+				sp:        vm.sp,
+				csLen:     len(vm.callStack),
+				framesLen: len(vm.frames),
+			})
+		case bytecode.OpPopHandler:
+			if len(vm.handlers) > 0 {
+				vm.handlers = vm.handlers[:len(vm.handlers)-1]
+			}
+		case bytecode.OpRaise:
+			msgIdx, err := vm.pop()
+			if err != nil {
+				return StatusStackUnderflow, err
+			}
+			msg := vm.strByIdx(msgIdx)
+			if newPC, ok := vm.throwException(msg); ok {
+				pc = newPC
+				break
+			}
+			return StatusUncaught, fmt.Errorf("uncaught exception: %s", msg)
 
 		// ===== 列表容器 =====
 		case bytecode.OpListNew:
@@ -1116,7 +1193,10 @@ func (vm *Interpreter) runCode(prog *bytecode.Program, startPC int) (st Status, 
 			if err != nil {
 				return StatusStackUnderflow, err
 			}
-			v, _ := vm.dicts[int(id)][vm.strByIdx(keyIdx)]
+			var v int64
+			if id >= 0 && int(id) < len(vm.dicts) {
+				v = vm.dicts[int(id)][vm.strByIdx(keyIdx)]
+			}
 			vm.push(v)
 		case bytecode.OpDictHas:
 			// 栈：[dict_id, key_str_idx]
@@ -1128,7 +1208,10 @@ func (vm *Interpreter) runCode(prog *bytecode.Program, startPC int) (st Status, 
 			if err != nil {
 				return StatusStackUnderflow, err
 			}
-			_, ok := vm.dicts[int(id)][vm.strByIdx(keyIdx)]
+			ok := false
+			if id >= 0 && int(id) < len(vm.dicts) {
+				_, ok = vm.dicts[int(id)][vm.strByIdx(keyIdx)]
+			}
 			if ok {
 				vm.push(1)
 			} else {
@@ -1493,6 +1576,34 @@ func (vm *Interpreter) restoreFrame() {
 	f := vm.frames[len(vm.frames)-1]
 	vm.frames = vm.frames[:len(vm.frames)-1]
 	copy(vm.locals[0:256], f.saved[:])
+}
+
+// --- Exception handling ---
+
+// throwException 把异常投递到最近的 handler：展开到 try 进入时的快照
+// （sp/callStack/frames），把消息 str_idx 压栈，返回 handler 起始 pc。
+//
+// locals 处理：
+//   - 异常与 try 同帧（len(frames)==framesLen）：不回滚 locals——try 内的赋值保留；
+//   - 异常来自更深调用帧：恢复 frames[framesLen].saved，即 try 帧发起该调用时的
+//     locals 快照（OpCall saveFrame 保存的正是调用者视角），深帧的改动被丢弃。
+//
+// 无 handler 时返回 ok=false（调用方转为硬错误）。
+func (vm *Interpreter) throwException(msg string) (int, bool) {
+	if len(vm.handlers) == 0 {
+		return 0, false
+	}
+	h := vm.handlers[len(vm.handlers)-1]
+	vm.handlers = vm.handlers[:len(vm.handlers)-1]
+	if len(vm.frames) > h.framesLen {
+		copy(vm.locals[0:256], vm.frames[h.framesLen].saved[:])
+	}
+	vm.frames = vm.frames[:h.framesLen]
+	vm.callStack = vm.callStack[:h.csLen]
+	vm.sp = h.sp
+	idx := vm.strIntern(msg)
+	vm.push(idx)
+	return h.handlerPC, true
 }
 
 // --- 高并发：go 线程 ---

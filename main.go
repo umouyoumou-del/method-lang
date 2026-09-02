@@ -179,6 +179,7 @@ func runCompile(input, output string) {
 		}
 		os.Exit(4)
 	}
+	resolveImports(tree, input)
 	comp := compiler.NewCompiler()
 	prog := comp.Compile(tree)
 	if len(comp.Errors()) > 0 {
@@ -218,6 +219,7 @@ func runMTFile(path string) {
 		}
 		os.Exit(4)
 	}
+	resolveImports(tree, path)
 	comp := compiler.NewCompiler()
 	prog := comp.Compile(tree)
 	if len(comp.Errors()) > 0 {
@@ -258,4 +260,79 @@ func runProgram(prog *bytecode.Program) {
 		fmt.Fprintln(os.Stderr)
 		os.Exit(10)
 	}
+}
+
+// ========== import 解析 ==========
+
+// resolveImports 解析顶层 import：把被导入文件中的类定义合入主 AST。
+//
+// 查找顺序：<主文件目录>/<模块名>.mt → <主文件目录>/../<模块名>.mt
+// （Windows 文件系统大小写不敏感，可命中 Wikidot.mt）。
+// 仅合入 NClass/NInterface 定义；被导入文件的顶层语句不会执行，
+// 因此库文件底部的演示代码不会运行。
+func resolveImports(tree *ast.Node, mainPath string) {
+	merged := map[string]bool{}
+	resolveImportsRec(tree, filepath.Dir(mainPath), 0, merged)
+}
+
+func resolveImportsRec(tree *ast.Node, dir string, depth int, merged map[string]bool) {
+	if tree == nil || depth > 8 {
+		return
+	}
+	// 用索引循环：合入的类节点追加在末尾，不会被重复处理（Kind 非 NImport）
+	for i := 0; i < len(tree.Children); i++ {
+		node := tree.Children[i]
+		if node == nil || node.Kind != ast.NImport {
+			continue
+		}
+		// import X; → Text=""，模块名在首个 item；from X import ... → Text=X
+		modName := node.Text
+		if modName == "" && len(node.Children) > 0 && node.Children[0] != nil {
+			modName = node.Children[0].Text
+		}
+		if modName == "" || merged[modName] {
+			continue
+		}
+		merged[modName] = true
+		path := findModuleFile(dir, modName)
+		if path == "" {
+			fmt.Fprintf(os.Stderr, "warning: import %q: 未找到 %s.mt（查找 %s 及其父目录）\n",
+				modName, modName, dir)
+			continue
+		}
+		src, err := readSrc(path)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "warning: import %q: %v\n", modName, err)
+			continue
+		}
+		subTree, errs, perr := parseSrc(src, path)
+		if perr != nil {
+			for _, e := range errs {
+				fmt.Fprintf(os.Stderr, "warning: import %q: %s\n", modName, e)
+			}
+			continue
+		}
+		// 先递归处理被导入文件自己的 import（其类定义随子树合入）
+		resolveImportsRec(subTree, filepath.Dir(path), depth+1, merged)
+		// 追加类/接口定义到主 AST 末尾（类在编译 pre-pass 中统一扫描，顺序无关）
+		for _, c := range subTree.Children {
+			if c != nil && (c.Kind == ast.NClass || c.Kind == ast.NInterface) {
+				tree.Children = append(tree.Children, c)
+			}
+		}
+	}
+}
+
+// findModuleFile 在 dir 与 dir 的父目录中查找 <name>.mt
+func findModuleFile(dir, name string) string {
+	cands := []string{
+		filepath.Join(dir, name+".mt"),
+		filepath.Join(filepath.Dir(dir), name+".mt"),
+	}
+	for _, c := range cands {
+		if st, err := os.Stat(c); err == nil && !st.IsDir() {
+			return c
+		}
+	}
+	return ""
 }

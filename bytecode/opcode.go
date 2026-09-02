@@ -81,12 +81,13 @@ const (
 	OpStrAppendStr  Op = 0x6B // [dst_str_idx, src_str_idx] → [new_str_idx]（拼接两个字符串）
 
 	// HTTP 客户端操作（简化一步式：OpHttpRequest 底层用 Go net/http + cookie jar）
-	OpHttpRequest   Op = 0x70 // [url_str_idx, method_str_idx, body_str_idx] → [status, body_str_idx]
-	OpHttpSetUA     Op = 0x71 // [ua_str_idx] → []（设置全局 User-Agent）
-	OpHttpAddHdr    Op = 0x72 // [key_str_idx, val_str_idx] → []（添加全局默认 header）
-	OpHttpGetCookie Op = 0x73 // [name_str_idx] → [value_str_idx]（从 cookie jar 读 cookie）
-	OpHttpClear     Op = 0x74 // [] → []（清空 cookie jar）
-	OpSystemExec    Op = 0x79
+	OpHttpRequest    Op = 0x70 // [url_str_idx, method_str_idx, body_str_idx] → [status, body_str_idx]
+	OpHttpSetUA      Op = 0x71 // [ua_str_idx] → []（设置全局 User-Agent）
+	OpHttpAddHdr     Op = 0x72 // [key_str_idx, val_str_idx] → []（添加全局默认 header）
+	OpHttpGetCookie  Op = 0x73 // [name_str_idx] → [value_str_idx]（从 cookie jar 读 cookie）
+	OpHttpClear      Op = 0x74 // [] → []（清空 cookie jar）
+	OpSystemExec     Op = 0x79
+	OpSystemReadFile Op = 0x7A // [path_str_idx] → [ok(0/1), content_str_idx]（读文本文件）
 
 	// 列表容器
 	OpListNew      Op = 0xA0 // [] → [list_id]
@@ -129,6 +130,11 @@ const (
 	OpChanNew Op = 0x91 // [capacity] → [chan_id]
 	OpChanPut Op = 0x92 // [chan_id, value] → []；满则阻塞
 	OpChanGet Op = 0x93 // [chan_id] → [value]；空则阻塞
+
+	// 异常处理（handler 栈模型）
+	OpPushHandler Op = 0x95 // i32 handler offset；记录 sp/帧快照，压入 handler 栈
+	OpPopHandler  Op = 0x96 // 弹出 handler（try 体正常结束）
+	OpRaise       Op = 0x97 // [msg_str_idx] → 抛出异常；无 handler 则硬错误
 
 	OpHalt Op = 0xFF
 )
@@ -232,6 +238,8 @@ func OpName(op Op) string {
 		return "HttpClear"
 	case OpSystemExec:
 		return "SystemExec"
+	case OpSystemReadFile:
+		return "SystemReadFile"
 	case OpListNew:
 		return "ListNew"
 	case OpListPush:
@@ -296,6 +304,12 @@ func OpName(op Op) string {
 		return "ChanPut"
 	case OpChanGet:
 		return "ChanGet"
+	case OpPushHandler:
+		return "PushHandler"
+	case OpPopHandler:
+		return "PopHandler"
+	case OpRaise:
+		return "Raise"
 	case OpHalt:
 		return "Halt"
 	}
@@ -334,6 +348,7 @@ func InstructionSize(op Op) int {
 	case OpStrNew, OpStrAppendC, OpStrLen, OpStrGetC, OpStrDelete,
 		OpStrFind, OpStrSlice, OpStrEqual, OpStrNewFromIdx, OpStrTrim, OpStrReplace, OpStrAppendStr,
 		OpHttpRequest, OpHttpSetUA, OpHttpAddHdr, OpHttpGetCookie, OpHttpClear, OpSystemExec,
+		OpSystemReadFile,
 		OpListNew, OpListPush, OpListGet, OpListSet, OpListPop, OpListLen, OpListDeleteAt, OpListRelease,
 		OpDictNew, OpDictPut, OpDictGet, OpDictHas, OpDictDelete, OpDictLen, OpDictRelease,
 		OpAtoi, OpItoa, OpSleep, OpNow:
@@ -342,6 +357,10 @@ func InstructionSize(op Op) int {
 		OpGetStatic, OpSetStatic, OpInvokeSuper, OpObjRelease:
 		return 1
 	case OpGo, OpChanNew, OpChanPut, OpChanGet:
+		return 1
+	case OpPushHandler:
+		return 1 + 4
+	case OpPopHandler, OpRaise:
 		return 1
 	case OpHalt:
 		return 1

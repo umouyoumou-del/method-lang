@@ -51,6 +51,7 @@ const (
 	NInterface
 	NBinary // 二元运算
 	NGo     // go 语句：children[0]=方法名, children[1]=参数列表
+	NFinally
 )
 
 // NodeKindName 返回节点种类的可读名称
@@ -63,7 +64,7 @@ func NodeKindName(k NodeKind) string {
 		"Lambda", "Yield", "Unary", "Compare", "Call",
 		"Index", "Member", "Name", "Int", "Float", "String", "Bool",
 		"Null", "This", "ListExpr", "New", "InstanceOf", "Super", "Interface",
-		"Binary", "Go",
+		"Binary", "Go", "Finally",
 	}
 	if int(k) >= 0 && int(k) < len(names) {
 		return names[k]

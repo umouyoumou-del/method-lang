@@ -264,6 +264,43 @@ class HtmlHelper {
         }
         return tags;
     }
+
+    // 从 ListPages HTML 提取页面 fullname 列表（href="/xxx"），去重并过滤非页面链接
+    method extract_page_fullnames(html) {
+        var names = list.new();
+        var rest = html;
+        var cont = 1;
+        while (cont == 1) {
+            var h_idx = str.find(rest, "href=\"/");
+            if (h_idx < 0) { cont = 0; }
+            if (h_idx >= 0) {
+                rest = str.slice(rest, h_idx + 7, str.len(rest));
+                var q_idx = str.find(rest, "\"");
+                if (q_idx < 0) { cont = 0; }
+                if (q_idx >= 0) {
+                    var path = str.slice(rest, 0, q_idx);
+                    rest = str.slice(rest, q_idx + 1, str.len(rest));
+                    var ok = 1;
+                    if (str.len(path) == 0) { ok = 0; }
+                    if (str.find(path, " ") >= 0) { ok = 0; }
+                    if (str.find(path, "?") >= 0) { ok = 0; }
+                    if (str.find(path, "#") >= 0) { ok = 0; }
+                    if (str.find(path, "javascript") >= 0) { ok = 0; }
+                    if (ok == 1) {
+                        var dup = 0;
+                        var n = list.len(names);
+                        var i = 0;
+                        while (i < n) {
+                            if (str.equal(list.get(names, i), path) == 1) { dup = 1; }
+                            i = i + 1;
+                        }
+                        if (dup == 0) { list.push(names, path); }
+                    }
+                }
+            }
+        }
+        return names;
+    }
 }
 
 // ==================== Wikidot Client ====================
@@ -467,6 +504,141 @@ class WikidotClient {
         var params = str.concat(pid, tg);
         this.call_action("WikiPageAction", "saveTags", params);
         return 0;
+    }
+
+    // ===== 批量标签 API =====
+    // "a b c" → list
+    method split_tags(tags_str) {
+        var res = list.new();
+        var rest = str.trim(tags_str);
+        var cont = 1;
+        while (cont == 1) {
+            if (str.len(rest) == 0) { cont = 0; }
+            if (str.len(rest) > 0) {
+                var sp = str.find(rest, " ");
+                if (sp < 0) {
+                    list.push(res, rest);
+                    cont = 0;
+                }
+                if (sp >= 0) {
+                    var word = str.trim(str.slice(rest, 0, sp));
+                    if (str.len(word) > 0) { list.push(res, word); }
+                    rest = str.slice(rest, sp + 1, str.len(rest));
+                }
+            }
+        }
+        return res;
+    }
+
+    // list → "a b c"
+    method join_tags(tags) {
+        var out = "";
+        var n = list.len(tags);
+        var i = 0;
+        while (i < n) {
+            if (i > 0) { out = str.concat(out, " "); }
+            out = str.concat(out, list.get(tags, i));
+            i = i + 1;
+        }
+        return out;
+    }
+
+    // list 是否包含某值（str 内容比较）
+    method list_contains(lst, val) {
+        var n = list.len(lst);
+        var i = 0;
+        while (i < n) {
+            if (str.equal(list.get(lst, i), val) == 1) { return 1; }
+            i = i + 1;
+        }
+        return 0;
+    }
+
+    // ListPages 收集 fullname 列表（按 category/tags 筛选）
+    method collect_page_fullnames(category, tags, per_page) {
+        var html = this.list_pages(category, tags, per_page);
+        var helper = new HtmlHelper();
+        return helper.extract_page_fullnames(html);
+    }
+
+    // 批量覆盖设置标签（每组整体替换），返回成功数
+    method batch_set_tags(fullnames, tags_str) {
+        var ok = 0;
+        var n = list.len(fullnames);
+        var i = 0;
+        while (i < n) {
+            var name = list.get(fullnames, i);
+            var r = this.set_page_tags(name, tags_str);
+            if (r == 0) { ok = ok + 1; }
+            if (i + 1 < n) { sleep(300); }
+            i = i + 1;
+        }
+        return ok;
+    }
+
+    // 批量追加标签（保留原有，自动去重），返回成功数
+    method batch_add_tags(fullnames, add_tags_str) {
+        var ok = 0;
+        var n = list.len(fullnames);
+        var i = 0;
+        while (i < n) {
+            var name = list.get(fullnames, i);
+            var cur = this.get_page_tags(name);
+            var merged = this.merge_tag_list(cur, add_tags_str);
+            var r = this.set_page_tags(name, this.join_tags(merged));
+            if (r == 0) { ok = ok + 1; }
+            if (i + 1 < n) { sleep(300); }
+            i = i + 1;
+        }
+        return ok;
+    }
+
+    // 批量移除标签，返回成功数
+    method batch_remove_tags(fullnames, remove_tags_str) {
+        var ok = 0;
+        var n = list.len(fullnames);
+        var i = 0;
+        while (i < n) {
+            var name = list.get(fullnames, i);
+            var cur = this.get_page_tags(name);
+            var kept = this.filter_out_tags(cur, remove_tags_str);
+            var r = this.set_page_tags(name, this.join_tags(kept));
+            if (r == 0) { ok = ok + 1; }
+            if (i + 1 < n) { sleep(300); }
+            i = i + 1;
+        }
+        return ok;
+    }
+
+    // 合并标签（复制 cur 后追加 add_tags_str 中不存在的标签）
+    method merge_tag_list(cur, add_tags_str) {
+        var res = list.new();
+        var n = list.len(cur);
+        var i = 0;
+        while (i < n) { list.push(res, list.get(cur, i)); i = i + 1; }
+        var adds = this.split_tags(add_tags_str);
+        var m = list.len(adds);
+        var j = 0;
+        while (j < m) {
+            var t = list.get(adds, j);
+            if (this.list_contains(res, t) == 0) { list.push(res, t); }
+            j = j + 1;
+        }
+        return res;
+    }
+
+    // 从标签列表中剔除 remove_tags_str 里包含的标签
+    method filter_out_tags(cur, remove_tags_str) {
+        var res = list.new();
+        var rms = this.split_tags(remove_tags_str);
+        var n = list.len(cur);
+        var i = 0;
+        while (i < n) {
+            var t = list.get(cur, i);
+            if (this.list_contains(rms, t) == 0) { list.push(res, t); }
+            i = i + 1;
+        }
+        return res;
     }
 
     // ===== Edit API =====
@@ -868,6 +1040,8 @@ system.print_str("    call_module / call_action / call_www_action\n");
 system.print_str("  [Page]\n");
 system.print_str("    GetPageID / GetPageSource / GetPageHTML\n");
 system.print_str("    GetPageTags / SetPageTags\n");
+system.print_str("    BatchTags: collect_page_fullnames\n");
+system.print_str("               batch_set_tags / batch_add_tags / batch_remove_tags\n");
 system.print_str("    ListPages / GetPageHistory\n");
 system.print_str("    GetPageRevisionSource\n");
 system.print_str("  [Edit]\n");

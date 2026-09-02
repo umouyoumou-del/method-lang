@@ -852,6 +852,13 @@ func (p *Parser) parseTry() *ast.Node {
 				}
 			}
 			excBlock = p.parseBlock()
+		} else if p.accept(lexer.TAs) {
+			// except as e { }：无类型名，仅绑定消息变量
+			t := p.expect(lexer.TName, "exception variable name")
+			if t != nil {
+				asName = t.Text
+			}
+			excBlock = p.parseBlock()
 		} else {
 			excBlock = p.parseBlock()
 		}
@@ -863,10 +870,12 @@ func (p *Parser) parseTry() *ast.Node {
 		n.Add(exc)
 	}
 	if p.accept(lexer.TFinally) {
+		finLine := p.line()
 		fb := p.parseBlock()
-		n.Add(fb)
-	} else {
-		n.Add(nil)
+		// 用 NFinally 标记节点包裹，与无名 except（NBlock）区分
+		fn := ast.New(ast.NFinally, "", finLine)
+		fn.Add(fb)
+		n.Add(fn)
 	}
 	return n
 }
