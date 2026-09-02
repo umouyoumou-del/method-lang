@@ -1,0 +1,11 @@
+# Binary
+methodc.exe
+*.exe
+*.mlr
+
+# Test probes
+cmd_test/
+
+# IDE
+.vscode/
+.idea/
