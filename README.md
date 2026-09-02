@@ -1,69 +1,89 @@
 # method-lang
 
-栈式字节码虚拟机 + 编译器，用 Go 实现。附带 method 语言重写的 Wikidot-Golang 客户端。
+**method** 是一门栈式字节码虚拟机语言，编译器与虚拟机用 Go 实现。
+
+- 语言名：`method`　|　源码后缀：`.mt`　|　字节码：`.mlr`
+- 编译流程：`lexer → parser → AST → compiler → 字节码 → VM 解释执行`
+- 支持 OOP（class / static method / this / new）、递归、while 循环、内建 list / dict / string / HTTP
+
+## 快速开始
+
+```bash
+# 编译并运行 .mt 源码
+go run . lang/hello.mt
+
+# 编译为 .mlr 字节码文件
+go build -o methodc.exe .
+methodc lang/hello.mt --compile -o hello.mlr
+
+# 加载并执行字节码
+methodc hello.mlr
+
+# 仅打印 AST
+methodc lang/hello.mt --ast
+```
+
+选项别名（.NET 风格）：`/t:mlr` ≡ `--compile`，`/out:<file>` ≡ `-o <file>`
 
 ## 项目结构
 
 ```
 method/
-├── ast/           — AST 节点定义
-├── bytecode/      — opcode 定义
-├── compiler/      — method → 字节码编译器
 ├── lexer/         — 词法分析
-├── parser/        — 语法分析
-├── vm/            — 栈式字节码虚拟机
-├── lang/          — method 语言程序
-│   ├── main.mt    — Wikidot-Golang 完整重写
-│   ├── hello.mt   — Hello World
-│   ├── system.mt  — 系统功能演示
-│   ├── bench.mt   — 性能基准
-│   ├── concurrent.mt — 并发演示
-│   └── demo_exec.mt  — 执行演示
+├── parser/        — 语法分析 → AST
+├── ast/           — AST 节点定义
+├── compiler/      — AST → 字节码编译器（含内置函数降级）
+├── bytecode/      — opcode / 指令编码 / .mlr 序列化
+├── vm/            — 栈式字节码虚拟机（含 HTTP、Cookie Jar、容器、字符串表）
+├── lang/          — method 语言示例与库
+│   ├── hello.mt        — 最小示例（递归 / while / and / or）
+│   ├── system.mt       — System / String OOP 封装库
+│   ├── bench.mt        — 性能基准
+│   ├── concurrent.mt   — 并发演示
+│   ├── demo_exec.mt    — system.exec 外部命令演示
+│   ├── HtmlParser.mt   — HTML 解析库（DOM 树）
+│   └── Wikidot.mt      — Wikidot-Golang 完整重写
 ├── go.mod
-└── main.go        — 入口
+└── main.go        — methodc 入口
 ```
 
-## 快速开始
+## 语言特性
 
-```bash
-# 编译并运行 method 程序
-go run . lang/main.mt
-```
-
-## method 语言特性
-
-### 内置类型
-- **int** — 64 位整数（也是 str_idx / list_id / dict_id 的载体）
-- **string** — 通过 str 内置函数操作
-- **list** — 动态数组
-- **dict** — 哈希表
-
-### 内置函数
-
-| 类别 | 函数 |
-|------|------|
-| **system** | `print`, `print_str`, `print_char` |
-| **str** | `new`, `concat`, `len`, `get_c`, `slice`, `find`, `equal`, `trim`, `replace`, `append_c` |
-| **list** | `new`, `push`, `get`, `set`, `pop`, `len`, `delete_at` |
-| **dict** | `new`, `put`, `get`, `has`, `delete`, `len` |
-| **http** | `request(url, method, body)`, `set_ua`, `add_header`, `get_cookie`, `clear` |
-| **conv** | `atoi`, `itoa` |
-| **time** | `now`, `sleep` |
-
-### OOP 语法
+### 变量与类型
 
 ```
+var site : int;          // 显式类型声明（OOP 成员）
+x = 1 + 2 * 3;           // 推断赋值（全局/局部）
+```
+
+一切皆 64 位整数——字符串是字符串表索引（str_idx），list / dict / 对象都是句柄 id。
+
+### 函数与 OOP
+
+```
+// 顶层函数
+method fact(n) {
+    if (n < 2) { return 1; }
+    return n * fact(n - 1);
+}
+
+// 类 + 成员变量 + 方法
 class WikidotClient {
     var site : int;
     var token : int;
 
-    method init(site_name) {
+    method init(site_name) {     // 构造器
         this.site = site_name;
         this.token = "";
     }
+    method get_page_source(fullname) { ... }
+}
 
-    method get_page_source(fullname) {
-        // ...
+// 静态方法
+class System {
+    static method println(n) {
+        system.print(n);
+        system.print_char(10);
     }
 }
 
@@ -72,101 +92,89 @@ var client = new WikidotClient("backrooms-wiki-cn");
 
 ### 控制流
 
-- `if (cond) { ... } else { ... }`
-- `while (cond) { ... }`
-- `return expr;`
+```
+if (cond) { ... } else { ... }
+while (cond) { ... }
+return expr;
+```
 
-### 语言限制
+逻辑运算用关键字 `and` / `or`：
 
-method 是极简语言，以下特性**不可用**：
+```
+x = 1 and 0;   // 0
+y = 0 or 1;    // 1
+```
 
-| 不支持 | 替代方案 |
-|--------|----------|
-| `||` `&&` 逻辑运算符 | 嵌套 `if/else` |
-| `break` / `continue` | 条件变量 `while (cont == 1)` |
-| 三元运算符 `?:` | `if/else` |
-| `import` / module 系统 | 所有代码内嵌单文件 |
-| 浮点数 | 整数运算 |
-| HTML DOM 解析 | `str.find` / `str.slice` 字符串扫描 |
+## 内置函数
 
-## Wikidot-Golang 重写 (lang/main.mt)
+| 类别 | 函数 |
+|------|------|
+| **system** | `print`, `print_str`, `print_char`, `println`, `exec` |
+| **str** | `new`, `new_from_idx`, `concat`, `len`, `get_c`, `append_c`, `delete`, `find`, `slice`, `equal`, `trim`, `replace` |
+| **list** | `new`, `push`, `get`, `set`, `pop`, `len`, `delete_at` |
+| **dict** | `new`, `put`, `get`, `has`, `delete`, `len` |
+| **http** | `request(url, method, body)`, `set_ua`, `add_header`, `get_cookie`, `clear` |
+| **转换/时间** | `atoi`, `itoa`, `sleep(ms)`, `now()` |
 
-用 method 语言完整重实现了 [Wikidot-Golang](https://github.com/umouyoumou-del/Wikidot-Golang) 的全部 API。
+要点：
 
-### 已实现 API
+- 字符串函数统一使用 **rune 索引**，正确处理中文等多字节字符
+- `http.request` 返回 `list[body, status]`，自动维护 Cookie Jar（`cookiejar.New` + 30s 超时），自动设置同源 Referer
+- `list.push` / `list.set` / `dict.put` 等指令执行后把容器 id 压回栈，支持链式调用
 
-**Core**
-- `login(username, password)` — POST www.wikidot.com Login2Action
-- `ensure_token()` / `ensure_www_token()` — 站点 / www 子域 CSRF token
-- `call_module` / `call_action` / `call_www_action` — AJAX Module Connector 封装
+## lang/ 库与示例
 
-**Page**
-- `get_page_id(fullname)` — 从 HTML 提取 pageId
-- `get_page_source(fullname)` — viewsource/ViewSourceModule
-- `get_page_html(fullname)` — GET 页面原始 HTML
-- `get_page_tags(fullname)` — 从 HTML 提取 page-tags
-- `set_page_tags(fullname, tags_str)` — WikiPageAction/saveTags
-- `list_pages(category, tags, per_page)` — list/ListPagesModule
-- `get_page_history(fullname)` — history/PageRevisionListModule
-- `get_page_revision_source(revision_id)` — history/PageSourceModule
+### HtmlParser.mt — HTML 解析库
 
-**Edit**
-- `acquire_edit_lock(fullname, page_id)` — edit/PageEditModule
-- `release_edit_lock(...)` — WikiPageAction/removePageEditLock
-- `create_page(fullname, title, content, tags, comment)` — WikiPageAction/savePage
-- `edit_page(fullname, title, content, tags, comment)` — WikiPageAction/savePage
+递归下降 tokenizer + 栈式 DOM 树构建，无需正则。
 
-**Rename / Delete**
-- `rename_page(fullname, new_name)` — WikiPageAction/renamePage
-- `delete_page(fullname)` — WikiPageAction/deletePage
+```
+class HtmlNode:
+    get_attr(name)          — 属性值
+    has_class(class_name)   — class 匹配（单词级）
+    get_id()                — id 属性
+    find_by_tag / find_all_by_tag    — 按标签名查找后代
+    find_by_class / find_all_by_class — 按 class 查找后代
+    get_text / get_text_trimmed      — 后代文本拼接
 
-**Forum**
-- `get_forum_categories()` — forum/ForumStartModule
-- `create_forum_thread(category_id, title, content)` — ForumAction/newThread
-- `create_forum_post(thread_id, content)` — ForumAction/savePost
-- `get_forum_thread(thread_id)` — forum/ForumViewThreadModule
-- `get_forum_thread_posts(thread_id, page_no)` — forum/ForumViewThreadPostsModule
+class HtmlParser:
+    parse(html) — 解析 HTML，返回根 HtmlNode
+```
 
-**Mail**
-- `lookup_user_id(username)` — quickmodule UserLookupQModule
-- `send_mail(username, subject, content)` — DashboardMessageAction/send
-- `get_inbox_messages(page)` — dashboard/messages/DMInboxModule
-- `delete_mail(message_id)` — DashboardMessageAction/delete
+支持：嵌套标签、自闭合 `<img/>`、void 元素（`br`/`img`/`input` 等 13 种）、`<!-- 注释 -->`、`<!DOCTYPE>`、单/双引号及无引号属性。
 
-**User**
-- `get_user_id(username)` — www.wikidot.com/user:info
+### Wikidot.mt — Wikidot-Golang 完整重写
 
-### 实测验证 (backrooms-wiki-cn)
+用 method 语言重实现 [Wikidot-Golang](https://github.com/umouyoumou-del/Wikidot-Golang) 的全部 API（内嵌 JsonParser + HtmlParser）：
+
+| 模块 | API |
+|------|-----|
+| Core | `login`, `ensure_token`, `ensure_www_token`, `call_module`, `call_action`, `call_www_action` |
+| Page | `get_page_id`, `get_page_source`, `get_page_html`, `get_page_tags`, `set_page_tags`, `list_pages`, `get_page_history`, `get_page_revision_source` |
+| Edit | `acquire_edit_lock`, `release_edit_lock`, `create_page`, `edit_page` |
+| Rename/Delete | `rename_page`, `delete_page` |
+| Forum | `get_forum_categories`, `create_forum_thread`, `create_forum_post`, `get_forum_thread`, `get_forum_thread_posts` |
+| Mail | `lookup_user_id`, `send_mail`, `get_inbox_messages`, `delete_mail` |
+| User | `get_user_id` |
+
+实测（backrooms-wiki-cn）：
 
 ```
 [1] Token 获取          wikidot_token7 len: 32      OK
 [2] GetPageID('start')  Page ID: 1312481462          OK
 [3] GetPageSource       Source len: 12495            OK
-[4] GetPageTags         Tags count: 0                OK
 [5] ListPages           HTML len: 219287             OK
 [6] GetForumCategories  HTML len: 16875              OK
 [7] GetPageHistory      History HTML len: 37007      OK
 ```
 
-### 内嵌组件
+## 架构设计要点
 
-- **JsonParser** — 递归下降 JSON 解析器（无 break，纯条件循环）
-- **HtmlHelper** — HTML 字符串扫描辅助（提取 pageId / title / source / tags）
+- **栈式 VM**：编译器按顺序压参（arg0…argN-1），栈顶是最后一个参数；VM 先弹栈顶
+- **字符串表**：编译期 `InternString` 分配索引，运行时 strTable 与编译期共享前缀，`PushI64(idx) + StrNewFromIdx()` 零拷贝
+- **多返回值**：`http.request` 返回两个值，编译器用 `ListNew + Swap + ListPush` 封装成 list
+- **.mlr 序列化**：字节码 + 字符串表 + 常量池整体序列化，可脱离源码分发执行
 
-## 技术细节
+## License
 
-### VM 栈约定
-
-编译器按顺序压参数（arg0, arg1, ..., argN-1），栈顶是最后一个参数。VM 先弹栈顶再弹前面的。
-
-### 容器指令链式返回
-
-`list.push` / `list.set` / `dict.put` 等指令执行后把容器 id push 回栈，支持链式调用。编译器语句级调用后额外 Pop 掉多余的 id。
-
-### HTTP Cookie Jar
-
-VM 使用 `cookiejar.New` + `http.Client(Timeout=30s, InsecureSkipVerify)`。站点 HTTP 走这个 Client，平台 www.wikidot.com 登录走同一 Client（会话 cookie 跨子域共享）。
-
-### Rune 索引统一
-
-`str.find` / `str.get_c` / `str.slice` 统一使用 rune 索引（非字节索引），正确处理中文等多字节字符。
+MIT
