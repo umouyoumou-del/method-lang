@@ -1495,6 +1495,25 @@ func (vm *Interpreter) runCodeInner(prog *bytecode.Program, startPC int) (st Sta
 			}
 			vm.dicts[int(id)] = nil
 			vm.dictFree = append(vm.dictFree, int32(id))
+		case bytecode.OpDictKeys:
+			// [dict_id] → [list_id of str_idx keys]（供 range 迭代；无效 dict 返回空 list）
+			id, err := vm.pop()
+			if err != nil {
+				return StatusStackUnderflow, err
+			}
+			if id < 0 || int(id) >= len(vm.dicts) || vm.dicts[id] == nil {
+				vm.push(int64(0))
+				break
+			}
+			newList, err := vm.listAlloc()
+			if err != nil {
+				return StatusStackOverflow, err
+			}
+			for k := range vm.dicts[id] {
+				kidx := vm.strIntern(k)
+				vm.lists[newList] = append(vm.lists[newList], kidx)
+			}
+			vm.push(int64(newList))
 
 		// ===== 字符串增强 =====
 		case bytecode.OpStrFind:

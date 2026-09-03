@@ -428,6 +428,8 @@ type Compiler struct {
 	methodRets   map[string]int    // label → num rets（多返回值函数>1）
 	// 当前作用域内 var 名 → 绑定值的返回数（lambda block 多返回推导用）
 	retCounts map[string]int
+	// 当前作用域内 var 名 → 静态类型推断（"list"/"dict"/"str"），供 range 编译分派
+	varKinds map[string]string
 	// 类
 	classes       []*classInfo
 	classNameToID map[string]int
@@ -521,6 +523,7 @@ func NewCompiler() *Compiler {
 		methodRets:    map[string]int{},
 		classNameToID: map[string]int{},
 		retCounts:     map[string]int{},
+		varKinds:      map[string]string{},
 	}
 }
 
@@ -919,13 +922,22 @@ func (c *Compiler) compileStmt(n *ast.Node) {
 		c.compileForC(n)
 	case ast.NForIn:
 		c.compileForIn(n)
+	case ast.NForRange:
+		c.compileForRange(n)
 	case ast.NReturn:
 		c.compileReturn(n)
 	case ast.NBreak:
-		// 需要 breakLabel 栈，这里简单化：出警告
-		c.warnf("break not fully supported outside explicit loop label context")
+		if len(loopStack) > 0 {
+			c.builder.JmpTo(loopStack[len(loopStack)-1].breakLabel)
+		} else {
+			c.warnf("break outside loop")
+		}
 	case ast.NContinue:
-		c.warnf("continue not fully supported outside explicit loop label context")
+		if len(loopStack) > 0 {
+			c.builder.JmpTo(loopStack[len(loopStack)-1].continueLabel)
+		} else {
+			c.warnf("continue outside loop")
+		}
 	case ast.NPass:
 		// no-op
 	case ast.NAssert:
@@ -1269,6 +1281,238 @@ func (c *Compiler) compileForIn(n *ast.Node) {
 	}
 }
 
+// compileForRangeList —— list 模板（list_id 动态数组）
+func (c *Compiler) compileForRangeList(keyName, valName string, iter, body *ast.Node) {
+	iterSlot := c.allocTempSlot()
+	idxSlot := c.allocTempSlot()
+	var keySlot uint8
+	if keyName != "" {
+		keySlot = c.localSlot(keyName)
+	}
+	valSlot := c.localSlot(valName)
+	// 求值 iter → 存 list_id
+	c.compileExpr(iter)
+	c.builder.StoreLocal(iterSlot)
+	c.builder.PushI64(0)
+	c.builder.StoreLocal(idxSlot)
+	endLabel := freshLabel("range_end")
+	updateLabel := freshLabel("range_update")
+	startLabel := freshLabel("range_start")
+	c.enterLoopLabels(endLabel, updateLabel)
+	c.builder.Label(startLabel)
+	// cond: idx < len → continue（len > idx 为真继续）
+	c.builder.LoadLocal(iterSlot)
+	c.builder.ListLen()
+	c.builder.LoadLocal(idxSlot)
+	c.builder.CmpGt()
+	c.builder.JzTo(endLabel)
+	if keyName != "" {
+		c.builder.LoadLocal(idxSlot)
+		c.builder.StoreLocal(keySlot)
+	}
+	c.builder.LoadLocal(iterSlot)
+	c.builder.LoadLocal(idxSlot)
+	c.builder.ListGet()
+	c.builder.StoreLocal(valSlot)
+	c.compileStmt(body)
+	c.builder.Label(updateLabel)
+	c.builder.IncLocalImm8(idxSlot, 1)
+	c.builder.JmpTo(startLabel)
+	c.builder.Label(endLabel)
+	c.leaveLoopLabels()
+	// 清零临时槽（辅助 GC）
+	c.builder.PushI64(0)
+	c.builder.StoreLocal(iterSlot)
+	c.builder.PushI64(0)
+	c.builder.StoreLocal(idxSlot)
+}
+
+// compileForRangeStr —— str 模板（rune 索引迭代）
+func (c *Compiler) compileForRangeStr(keyName, valName string, iter, body *ast.Node) {
+	strSlot := c.allocTempSlot()
+	idxSlot := c.allocTempSlot()
+	var keySlot uint8
+	if keyName != "" {
+		keySlot = c.localSlot(keyName)
+	}
+	valSlot := c.localSlot(valName)
+	c.compileExpr(iter)
+	c.builder.StoreLocal(strSlot)
+	c.builder.PushI64(0)
+	c.builder.StoreLocal(idxSlot)
+	endLabel := freshLabel("range_end")
+	updateLabel := freshLabel("range_update")
+	startLabel := freshLabel("range_start")
+	c.enterLoopLabels(endLabel, updateLabel)
+	c.builder.Label(startLabel)
+	// cond: idx < rune_len → continue
+	c.builder.LoadLocal(strSlot)
+	c.builder.StrLen()
+	c.builder.LoadLocal(idxSlot)
+	c.builder.CmpGt()
+	c.builder.JzTo(endLabel)
+	if keyName != "" {
+		c.builder.LoadLocal(idxSlot)
+		c.builder.StoreLocal(keySlot)
+	}
+	// val = rune at idx
+	c.builder.LoadLocal(strSlot)
+	c.builder.LoadLocal(idxSlot)
+	c.builder.StrGetC()
+	c.builder.StoreLocal(valSlot)
+	c.compileStmt(body)
+	c.builder.Label(updateLabel)
+	c.builder.IncLocalImm8(idxSlot, 1)
+	c.builder.JmpTo(startLabel)
+	c.builder.Label(endLabel)
+	c.leaveLoopLabels()
+	c.builder.PushI64(0)
+	c.builder.StoreLocal(strSlot)
+	c.builder.PushI64(0)
+	c.builder.StoreLocal(idxSlot)
+}
+
+// compileForRangeDict —— dict 模板：OpDictKeys → key 列表 → ListGet key → DictGet val
+func (c *Compiler) compileForRangeDict(keyName, valName string, iter, body *ast.Node) {
+	dictSlot := c.allocTempSlot()
+	keysSlot := c.allocTempSlot()
+	idxSlot := c.allocTempSlot()
+	var keySlot uint8
+	if keyName != "" {
+		keySlot = c.localSlot(keyName)
+	}
+	valSlot := c.localSlot(valName)
+	c.compileExpr(iter)
+	c.builder.StoreLocal(dictSlot)
+	// keys list = OpDictKeys(dict)
+	c.builder.LoadLocal(dictSlot)
+	c.builder.DictKeys()
+	c.builder.StoreLocal(keysSlot)
+	c.builder.PushI64(0)
+	c.builder.StoreLocal(idxSlot)
+	endLabel := freshLabel("range_end")
+	updateLabel := freshLabel("range_update")
+	startLabel := freshLabel("range_start")
+	c.enterLoopLabels(endLabel, updateLabel)
+	c.builder.Label(startLabel)
+	// cond: idx < key_len → continue
+	c.builder.LoadLocal(keysSlot)
+	c.builder.ListLen()
+	c.builder.LoadLocal(idxSlot)
+	c.builder.CmpGt()
+	c.builder.JzTo(endLabel)
+	if keyName != "" {
+		// key = keys[idx]
+		c.builder.LoadLocal(keysSlot)
+		c.builder.LoadLocal(idxSlot)
+		c.builder.ListGet()
+		c.builder.StoreLocal(keySlot)
+		// val = dict[key]
+		c.builder.LoadLocal(dictSlot)
+		c.builder.LoadLocal(keySlot)
+		c.builder.DictGet()
+		c.builder.StoreLocal(valSlot)
+	} else {
+		// 单变量迭代 dict：与 Go 一致，val 得到 key（str_idx）
+		c.builder.LoadLocal(keysSlot)
+		c.builder.LoadLocal(idxSlot)
+		c.builder.ListGet()
+		c.builder.StoreLocal(valSlot)
+	}
+	c.compileStmt(body)
+	c.builder.Label(updateLabel)
+	c.builder.IncLocalImm8(idxSlot, 1)
+	c.builder.JmpTo(startLabel)
+	c.builder.Label(endLabel)
+	c.leaveLoopLabels()
+	c.builder.PushI64(0)
+	c.builder.StoreLocal(dictSlot)
+	c.builder.PushI64(0)
+	c.builder.StoreLocal(keysSlot)
+	c.builder.PushI64(0)
+	c.builder.StoreLocal(idxSlot)
+}
+
+// compileForRange —— Go 风格 range 迭代：
+//
+//	for v in range iter { body }
+//	for k, v in range iter { body }
+//
+// NForRange: Children[0]=keyVar(NName|nil), [1]=valVar(NName), [2]=iter, [3]=body。
+func (c *Compiler) compileForRange(n *ast.Node) {
+	keyNode := nth(n, 0)
+	valNode := nth(n, 1)
+	iter := nth(n, 2)
+	body := nth(n, 3)
+	if iter == nil || valNode == nil {
+		c.warnf("for-range requires an iterable expression")
+		return
+	}
+	keyName := ""
+	if keyNode != nil && keyNode.Kind == ast.NName && keyNode.Text != "" {
+		keyName = keyNode.Text
+	}
+	valName := valNode.Text
+	switch c.staticKindOf(iter) {
+	case "dict":
+		c.compileForRangeDict(keyName, valName, iter, body)
+	case "str":
+		c.compileForRangeStr(keyName, valName, iter, body)
+	default:
+		c.compileForRangeList(keyName, valName, iter, body)
+	}
+}
+
+// staticKindOf 对表达式做静态类型推断（供 range 选择迭代模板，未知一律按 list）。
+func (c *Compiler) staticKindOf(expr *ast.Node) string {
+	k := c.knownKindOf(expr)
+	if k == "" {
+		return "list"
+	}
+	return k
+}
+
+// knownKindOf 返回表达式的静态类型；无法推断时返回 ""。
+func (c *Compiler) knownKindOf(expr *ast.Node) string {
+	switch {
+	case expr == nil:
+		return ""
+	case expr.Kind == ast.NString:
+		return "str"
+	case expr.Kind == ast.NName:
+		if k, ok := c.varKinds[expr.Text]; ok && k != "" {
+			return k
+		}
+		return ""
+	case expr.Kind == ast.NCall:
+		if len(expr.Children) >= 1 {
+			callee := expr.Children[0]
+			full := ""
+			if callee.Kind == ast.NName {
+				full = callee.Text
+			} else if callee.Kind == ast.NMember && len(callee.Children) >= 2 &&
+				callee.Children[0] != nil && callee.Children[0].Kind == ast.NName &&
+				callee.Children[1] != nil {
+				full = callee.Children[0].Text + "." + callee.Children[1].Text
+			}
+			return kindFromBuiltinName(full)
+		}
+	}
+	return ""
+}
+
+func kindFromBuiltinName(full string) string {
+	switch {
+	case strings.HasPrefix(full, "dict."):
+		return "dict"
+	case strings.HasPrefix(full, "str."):
+		return "str"
+	case strings.HasPrefix(full, "slice."), strings.HasPrefix(full, "list."):
+		return "list"
+	}
+	return ""
+}
+
 // break/continue label 栈（简化版，每循环一对）
 type loopLabel struct{ breakLabel, continueLabel string }
 
@@ -1339,6 +1583,15 @@ func (c *Compiler) compileAssign(n *ast.Node) {
 			c.retCounts = map[string]int{}
 		}
 		c.retCounts[lhs.Text] = lambdaRetCount(nth(rhs, 1))
+	}
+	// 记录「名字 → 静态容器类型」：供 for-range 编译分派 dict/str/list
+	if lhs != nil && lhs.Kind == ast.NName {
+		if k := c.knownKindOf(rhs); k != "" {
+			if c.varKinds == nil {
+				c.varKinds = map[string]string{}
+			}
+			c.varKinds[lhs.Text] = k
+		}
 	}
 	// 先编译 RHS（保证只留 1 个主值）
 	c.compileRhs(rhs)
@@ -2026,6 +2279,7 @@ func (c *Compiler) compileClosureBody(pc *pendingClosure) {
 	savedCaptureStack := c.captureStack
 	savedRetN := c.curRetN
 	savedRetCounts := c.retCounts
+	savedVarKinds := c.varKinds
 	// 建立新作用域
 	c.currentLocals = map[string]uint8{}
 	c.nextSlot = 0
@@ -2034,6 +2288,7 @@ func (c *Compiler) compileClosureBody(pc *pendingClosure) {
 		c.curRetN = 1
 	}
 	c.retCounts = map[string]int{}
+	c.varKinds = map[string]string{}
 	// params → slot 0..nparams-1
 	for i, pn := range pc.params {
 		c.currentLocals[pn] = uint8(i)
@@ -2062,6 +2317,7 @@ func (c *Compiler) compileClosureBody(pc *pendingClosure) {
 	c.captureStack = savedCaptureStack
 	c.curRetN = savedRetN
 	c.retCounts = savedRetCounts
+	c.varKinds = savedVarKinds
 }
 
 // compileCall —— 支持：
@@ -2154,7 +2410,7 @@ func (c *Compiler) compileCall(n *ast.Node) {
 			}
 			// 先尝试识别内置模块方法：system.print / str.new / list.new / dict.new / http.request 等
 			if obj.Kind == ast.NName {
-				mods := map[string]bool{"system": true, "str": true, "math": true, "list": true, "dict": true, "http": true}
+				mods := map[string]bool{"system": true, "str": true, "math": true, "list": true, "slice": true, "dict": true, "http": true}
 				if mods[obj.Text] {
 					fullName := obj.Text + "." + methodName
 					if c.tryCompileBuiltin(fullName, args) {
@@ -2224,6 +2480,23 @@ func (c *Compiler) emitCallByLabel(label string, argc int) {
 
 // tryCompileBuiltin 尝试编译内置调用，成功返回 true
 func (c *Compiler) tryCompileBuiltin(name string, args []*ast.Node) bool {
+	// Go 风格 slice API 别名 → list（method list 本质是动态数组）
+	if strings.HasPrefix(name, "slice.") {
+		switch strings.TrimPrefix(name, "slice.") {
+		case "append":
+			name = "list.push"
+		case "new":
+			name = "list.new"
+		case "cap":
+			name = "list.len"
+		case "len":
+			name = "list.len"
+		case "get":
+			name = "list.get"
+		case "set":
+			name = "list.set"
+		}
+	}
 	switch name {
 	// 高并发内置：Go 风格缓冲通道
 	case "chan_new":
@@ -2799,6 +3072,8 @@ func (c *Compiler) compileClassMethodBody(cl *classInfo, m *classMethod) {
 func (c *Compiler) enterMethodScope() {
 	c.currentLocals = map[string]uint8{}
 	c.nextSlot = 0
+	c.retCounts = map[string]int{}
+	c.varKinds = map[string]string{}
 }
 func (c *Compiler) leaveMethodScope() {
 	c.currentLocals = nil
@@ -2844,9 +3119,16 @@ func (c *Compiler) allocTempSlot() uint8 {
 		c.nextSlot++
 		return s
 	}
-	// 顶层临时：用 255
-	return 255
+	// 顶层临时槽：高区 192..254 轮转（用法总是立即清零后释放）
+	s := toplevelTempNext
+	toplevelTempNext++
+	if toplevelTempNext > 254 {
+		toplevelTempNext = 192
+	}
+	return s
 }
+
+var toplevelTempNext uint8 = 192
 
 func labelOffset(b *Builder, label string) int32 {
 	if off, ok := b.labels[label]; ok {

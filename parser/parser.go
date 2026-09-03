@@ -841,11 +841,47 @@ func (p *Parser) parseFor() *ast.Node {
 		n.Add(body)
 		return n
 	}
-	// for-in
-	t := p.expect(lexer.TName, "loop variable name")
-	if t == nil {
+	// for-in / for-range
+	if !p.isKind(lexer.TName) {
+		p.errorf("expected loop variable name in for")
 		return nil
 	}
+	first := p.cur()
+	// 多变量：for k, v in range expr { body }
+	if p.peek(1).Kind == lexer.TokenKind(',') && p.peek(2).Kind == lexer.TName &&
+		p.peek(3).Kind == lexer.TIn && p.peek(4).Kind == lexer.TRange {
+		p.advance() // k
+		p.advance() // ,
+		second := p.cur()
+		p.advance()
+		p.advance() // in
+		p.advance() // range
+		iter := p.parseExpr()
+		body := p.parseBlock()
+		n := ast.New(ast.NForRange, "", line)
+		n.Add(ast.New(ast.NName, first.Text, first.Line))
+		n.Add(ast.New(ast.NName, second.Text, second.Line))
+		n.Add(iter)
+		n.Add(body)
+		return n
+	}
+	// 单变量：for v in range expr { body }
+	if p.peek(1).Kind == lexer.TIn && p.peek(2).Kind == lexer.TRange {
+		p.advance() // v
+		p.advance() // in
+		p.advance() // range
+		iter := p.parseExpr()
+		body := p.parseBlock()
+		n := ast.New(ast.NForRange, "", line)
+		n.Add(ast.New(ast.NNull, "", line)) // 无 key 占位（ast.Add 忽略 nil）
+		n.Add(ast.New(ast.NName, first.Text, first.Line))
+		n.Add(iter)
+		n.Add(body)
+		return n
+	}
+	// 旧 for-in：for NAME in iter（仅列表字面量展开）
+	p.advance()
+	t := first
 	p.expect(lexer.TIn, "'in'")
 	iter := p.parseExpr()
 	body := p.parseBlock()
