@@ -826,33 +826,20 @@ func (vm *Interpreter) runCode(prog *bytecode.Program, startPC int) (st Status, 
 			vm.callStack = append(vm.callStack, np)
 			pc = np + int(off)
 		case bytecode.OpRet:
-			// 丢弃当前帧及更深帧残留的 handler（return 穿出 try 时的泄漏防护）：
-			// 当前帧的 handler 创建于 len(frames)==D（D=当前帧深度），Ret 时 len(frames)==D
-			for len(vm.handlers) > 0 && vm.handlers[len(vm.handlers)-1].framesLen >= len(vm.frames) {
-				vm.handlers = vm.handlers[:len(vm.handlers)-1]
+			st, err := vm.opReturnN(code, &pc, 1)
+			if st != StatusOk {
+				return st, err
 			}
-			retVal, err := vm.pop()
-			if err != nil {
-				return StatusStackUnderflow, err
+		case bytecode.OpRetN:
+			// 布局：[op][u8 retN]
+			if pc >= len(code) {
+				return StatusTruncated, nil
 			}
-			// 在 restoreFrame 弹出帧前，先 peek 当前帧是否是构造函数返回
-			// （构造函数返回时，用 objID 替代 constructor retval 压栈）
-			pending := int32(-1)
-			if len(vm.frames) > 0 {
-				pending = vm.frames[len(vm.frames)-1].pendingNewObj
-			}
-			vm.restoreFrame()
-			if len(vm.callStack) == 0 {
-				// 顶层 return → 退出
-				return StatusOk, nil
-			}
-			top := len(vm.callStack) - 1
-			pc = vm.callStack[top]
-			vm.callStack = vm.callStack[:top]
-			if pending >= 0 {
-				vm.push(int64(pending))
-			} else {
-				vm.push(retVal)
+			retN := code[pc]
+			pc++
+			st, err := vm.opReturnN(code, &pc, int(retN))
+			if st != StatusOk {
+				return st, err
 			}
 		// === 字符串表操作 ===
 		case bytecode.OpStrNew:
@@ -1776,6 +1763,50 @@ func (vm *Interpreter) restoreFrame() {
 	f := vm.frames[len(vm.frames)-1]
 	vm.frames = vm.frames[:len(vm.frames)-1]
 	copy(vm.locals[0:256], f.saved[:])
+}
+
+// opReturnN —— OpRet(1)/OpRetN(n) 的统一返回路径：
+// 从栈顶取 retN 个返回值 → 清理本帧 handler → 恢复调用帧 → 回写返回值。
+// 帧深度为 curD=len(frames)；返回前运行归属于该帧的 defer（特性 3）。
+func (vm *Interpreter) opReturnN(code []byte, pc *int, retN int) (Status, error) {
+	if retN < 1 {
+		retN = 1
+	}
+	// 丢弃当前帧及更深帧残留的 handler（return 穿出 try 时的泄漏防护）：
+	// 当前帧的 handler 创建于 len(frames)==D（D=当前帧深度），Ret 时 len(frames)==D
+	for len(vm.handlers) > 0 && vm.handlers[len(vm.handlers)-1].framesLen >= len(vm.frames) {
+		vm.handlers = vm.handlers[:len(vm.handlers)-1]
+	}
+	rets := make([]int64, retN)
+	for i := retN - 1; i >= 0; i-- {
+		v, err := vm.pop()
+		if err != nil {
+			return StatusStackUnderflow, err
+		}
+		rets[i] = v
+	}
+	// 在 restoreFrame 弹出帧前，先 peek 当前帧是否是构造函数返回
+	// （构造函数返回时，用 objID 替代 constructor retval 压栈）
+	pending := int32(-1)
+	if len(vm.frames) > 0 {
+		pending = vm.frames[len(vm.frames)-1].pendingNewObj
+	}
+	vm.restoreFrame()
+	if len(vm.callStack) == 0 {
+		// 顶层 return → 退出
+		return StatusOk, nil
+	}
+	top := len(vm.callStack) - 1
+	*pc = vm.callStack[top]
+	vm.callStack = vm.callStack[:top]
+	if pending >= 0 {
+		vm.push(int64(pending))
+	} else {
+		for i := 0; i < retN; i++ {
+			vm.push(rets[i])
+		}
+	}
+	return StatusOk, nil
 }
 
 // --- Exception handling ---

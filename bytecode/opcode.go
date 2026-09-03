@@ -66,6 +66,9 @@ const (
 	OpCall Op = 0x50 // i32 offset
 	OpRet  Op = 0x51
 
+	// 多返回值：返回时按顺序把 retN 个值从栈弹出再压回调用方（v0 在底）
+	OpRetN Op = 0x52 // u8 retN
+
 	// 字符串表操作（索引 i64 引用字符串对象）
 	OpStrNew        Op = 0x60
 	OpStrAppendC    Op = 0x61 // [str_idx, char] → [str_idx]
@@ -150,6 +153,11 @@ const (
 	OpLoadCapture  Op = 0x55 // u8 slot → [captured_value]
 	OpStoreCapture Op = 0x56 // u8 slot → [v] → []
 
+	// defer 延迟调用：记录帧级回调
+	OpDeferPush Op = 0x58 // i32 entryPC, u8 argc, u8 ncapture, u8 isClosure
+	// 字典键表（range 迭代用）
+	OpDictKeys Op = 0x59 // [dict_id] → [list_id of str_idx keys]
+
 	OpHalt Op = 0xFF
 )
 
@@ -216,6 +224,8 @@ func OpName(op Op) string {
 		return "Call"
 	case OpRet:
 		return "Ret"
+	case OpRetN:
+		return "RetN"
 	case OpStrNew:
 		return "StrNew"
 	case OpStrAppendC:
@@ -340,6 +350,10 @@ func OpName(op Op) string {
 		return "LoadCapture"
 	case OpStoreCapture:
 		return "StoreCapture"
+	case OpDeferPush:
+		return "DeferPush"
+	case OpDictKeys:
+		return "DictKeys"
 	case OpHalt:
 		return "Halt"
 	}
@@ -375,6 +389,8 @@ func InstructionSize(op Op) int {
 		return 1 + 4
 	case OpRet:
 		return 1
+	case OpRetN:
+		return 1 + 1 // opcode + u8 retN
 	case OpStrNew, OpStrAppendC, OpStrLen, OpStrGetC, OpStrDelete,
 		OpStrFind, OpStrSlice, OpStrEqual, OpStrNewFromIdx, OpStrTrim, OpStrReplace, OpStrAppendStr,
 		OpHttpRequest, OpHttpSetUA, OpHttpAddHdr, OpHttpGetCookie, OpHttpClear, OpSystemExec,
@@ -402,6 +418,10 @@ func InstructionSize(op Op) int {
 		return 1
 	case OpLoadCapture, OpStoreCapture:
 		return 1 + 1 // opcode + u8 slot
+	case OpDeferPush:
+		return 1 + 4 + 1 + 1 + 1 // opcode + i32 entryPC + u8 argc + u8 ncapture + u8 isClosure
+	case OpDictKeys:
+		return 1
 	case OpHalt:
 		return 1
 	}

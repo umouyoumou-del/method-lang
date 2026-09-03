@@ -19,6 +19,9 @@ type Parser struct {
 	tokens []*lexer.Token // 预读缓存
 	pos    int
 	errors []string
+	// suppressTuple>0 表示处于逗号分隔表达式上下文（调用参数/列表字面量等），
+	// parseAssignment 不得把 "a, b" 误判为多目标赋值
+	suppressTuple int
 }
 
 // New 创建 Parser
@@ -667,6 +670,22 @@ func (p *Parser) parseMethod(mods int) *ast.Node {
 	params := p.parseParamList()
 	p.expectRune(')', "')' after params")
 	n.Add(params)
+	// 可选返回值类型列表：method f(a, b) (int, str) { ... } → retN = 类型个数
+	if p.isRune('(') {
+		p.advance()
+		retN := 0
+		for !p.isRune(')') && !p.isKind(lexer.TEOF) {
+			typ := p.parseType()
+			if typ != nil {
+				retN++
+			}
+			if !p.acceptRune(',') {
+				break
+			}
+		}
+		p.expectRune(')', "')' to close return type list")
+		n.IVal = int64(retN)
+	}
 	// body or ;
 	if p.acceptRune(';') {
 		n.Add(nil)
@@ -884,10 +903,31 @@ func (p *Parser) parseReturn() *ast.Node {
 	line := p.line()
 	p.advance() // return
 	n := ast.New(ast.NReturn, "", line)
+	// return 的逗号属于多返回值列表而非多目标赋值，期间抑制 tuple 赋值解析
+	p.suppressTuple++
 	if !p.isRune(';') && !p.isRune('}') && !p.isKind(lexer.TEOF) {
 		e := p.parseExpr()
-		n.Add(e)
+		if e == nil {
+			p.suppressTuple--
+			return n
+		}
+		if p.isRune(',') {
+			// 多返回值：return a, b, c;
+			list := ast.New(ast.NList, "rets", line)
+			list.Add(e)
+			for p.acceptRune(',') {
+				extra := p.parseExpr()
+				if extra == nil {
+					break
+				}
+				list.Add(extra)
+			}
+			n.Add(list)
+		} else {
+			n.Add(e)
+		}
 	}
+	p.suppressTuple--
 	p.acceptRune(';')
 	return n
 }
@@ -919,6 +959,7 @@ func (p *Parser) parseWith() *ast.Node {
 	p.advance()
 	n := ast.New(ast.NWith, "", line)
 	first := true
+	p.suppressTuple++
 	for {
 		if !first && !p.acceptRune(',') {
 			break
@@ -939,6 +980,7 @@ func (p *Parser) parseWith() *ast.Node {
 			break
 		}
 	}
+	p.suppressTuple--
 	body := p.parseBlock()
 	n.Add(body)
 	return n
@@ -986,6 +1028,11 @@ func (p *Parser) parseExprStmt() *ast.Node {
 	if e == nil {
 		return nil
 	}
+	// 多目标赋值 a, b = f()：是语句而非表达式，不包裹 NExprStmt
+	if e.Kind == ast.NMultiAssign {
+		p.acceptRune(';')
+		return e
+	}
 	n := ast.New(ast.NExprStmt, "", line)
 	n.Add(e)
 	p.acceptRune(';')
@@ -1013,9 +1060,11 @@ func (p *Parser) parseGoStmt() *ast.Node {
 		return nil
 	}
 	p.advance()
+	p.suppressTuple++
 	for !p.isRune(')') {
 		a := p.parseAssignment()
 		if a == nil {
+			p.suppressTuple--
 			return nil
 		}
 		args.Add(a)
@@ -1024,6 +1073,7 @@ func (p *Parser) parseGoStmt() *ast.Node {
 		}
 		p.advance()
 	}
+	p.suppressTuple--
 	if !p.isRune(')') {
 		p.errorf("expected ')' to close go args")
 		return nil
@@ -1040,8 +1090,9 @@ func (p *Parser) parseGoStmt() *ast.Node {
 //	var x = expr;           → x = expr
 //	var x : type;           → x = 0（类型仅作注记）
 //	var x : type = expr;    → x = expr
+//	var q, r = divmod(..);  → NMultiAssign（多返回值同时接收）
 //
-// 统一降为 NAssign，slot 分配沿用既有赋值路径。
+// 单值统一降为 NAssign（Text="var"），slot 分配沿用既有赋值路径。
 func (p *Parser) parseVarDecl() *ast.Node {
 	line := p.line()
 	p.advance() // 'var'
@@ -1049,9 +1100,16 @@ func (p *Parser) parseVarDecl() *ast.Node {
 	if t == nil {
 		return nil
 	}
-	name := ast.New(ast.NName, t.Text, t.Line)
-	// 可选类型标注 ': type'（仅语法层面，字节码无类型）
-	if p.isRune(':') {
+	names := []*ast.Node{ast.New(ast.NName, t.Text, t.Line)}
+	// 可选类型标注 ': type'（仅单变量；多变量声明不做类型标注）
+	for p.acceptRune(',') {
+		nt := p.expect(lexer.TName, "variable name after ','")
+		if nt == nil {
+			return nil
+		}
+		names = append(names, ast.New(ast.NName, nt.Text, nt.Line))
+	}
+	if len(names) == 1 && p.isRune(':') {
 		p.advance()
 		if p.expect(lexer.TName, "type name after ':'") == nil {
 			return nil
@@ -1067,11 +1125,22 @@ func (p *Parser) parseVarDecl() *ast.Node {
 	} else {
 		rhs = ast.New(ast.NInt, "0", line)
 	}
-	n := ast.New(ast.NAssign, "var", line)
-	n.Add(name)
-	n.Add(rhs)
 	p.acceptRune(';')
-	return n
+	if len(names) == 1 {
+		n := ast.New(ast.NAssign, "var", line)
+		n.Add(names[0])
+		n.Add(rhs)
+		return n
+	}
+	// 多目标：var a, b = f()
+	multi := ast.New(ast.NMultiAssign, "var", line)
+	lhsList := ast.New(ast.NList, "lhs", line)
+	for _, nm := range names {
+		lhsList.Add(nm)
+	}
+	multi.Add(lhsList)
+	multi.Add(rhs)
+	return multi
 }
 
 // ===== 表达式（显式优先级，最低→最高）=====
@@ -1091,6 +1160,29 @@ func (p *Parser) parseAssignment() *ast.Node {
 	left := p.parseOrExpr()
 	if left == nil {
 		return nil
+	}
+	// 多目标赋值：a, b, c = f()（仅不在逗号分隔上下文内时）
+	if left.Kind == ast.NName && p.isRune(',') && p.suppressTuple == 0 {
+		lhsList := ast.New(ast.NList, "lhs", line)
+		lhsList.Add(left)
+		for p.acceptRune(',') {
+			nt := p.expect(lexer.TName, "assignment target name after ','")
+			if nt == nil {
+				return left
+			}
+			lhsList.Add(ast.New(ast.NName, nt.Text, nt.Line))
+		}
+		if p.acceptRune('=') {
+			rhs := p.parseAssignment()
+			multi := ast.New(ast.NMultiAssign, "=", line)
+			multi.Add(lhsList)
+			if rhs != nil {
+				multi.Add(rhs)
+			}
+			return multi
+		}
+		p.errorf("expected '=' after multiple assignment targets")
+		return left
 	}
 	// 赋值 / 复合赋值
 	cur := p.cur()
@@ -1515,6 +1607,7 @@ func (p *Parser) parseArgList() *ast.Node {
 	if p.isRune(')') {
 		return list
 	}
+	p.suppressTuple++
 	for {
 		e := p.parseExpr()
 		if e == nil {
@@ -1525,6 +1618,7 @@ func (p *Parser) parseArgList() *ast.Node {
 			break
 		}
 	}
+	p.suppressTuple--
 	return list
 }
 
@@ -1574,6 +1668,7 @@ func (p *Parser) parsePrimary() *ast.Node {
 		p.advance()
 		args := ast.New(ast.NList, "", line)
 		if !p.isRune(']') {
+			p.suppressTuple++
 			for {
 				e := p.parseExpr()
 				if e == nil {
@@ -1584,6 +1679,7 @@ func (p *Parser) parsePrimary() *ast.Node {
 					break
 				}
 			}
+			p.suppressTuple--
 		}
 		p.expectRune(']', "']' to close list literal")
 		listNode := ast.New(ast.NListExpr, "", line)

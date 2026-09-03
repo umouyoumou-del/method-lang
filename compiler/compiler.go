@@ -138,6 +138,15 @@ func (b *Builder) CmpNe() { b.emit(bytecode.OpCmpNe) }
 
 func (b *Builder) Call(off int32) { b.emit(bytecode.OpCall); b.emitI32(off) }
 func (b *Builder) Ret()           { b.emit(bytecode.OpRet) }
+func (b *Builder) RetN(n uint8)   { b.emit(bytecode.OpRetN); b.emitU8(n) }
+func (b *Builder) DeferPush(entryPC int32, argc, ncapture, isClosure uint8) {
+	b.emit(bytecode.OpDeferPush)
+	b.emitI32(entryPC)
+	b.emitU8(argc)
+	b.emitU8(ncapture)
+	b.emitU8(isClosure)
+}
+func (b *Builder) DictKeys() { b.emit(bytecode.OpDictKeys) }
 
 func (b *Builder) StrNew()     { b.emit(bytecode.OpStrNew) }
 func (b *Builder) StrAppendC() { b.emit(bytecode.OpStrAppendC) }
@@ -400,6 +409,9 @@ type Compiler struct {
 	methods      []*methodInfo
 	methodLabels map[string]string // callable name → label
 	methodParams map[string]int    // label → num params
+	methodRets   map[string]int    // label → num rets（多返回值函数>1）
+	// 当前作用域内 var 名 → 绑定值的返回数（lambda block 多返回推导用）
+	retCounts map[string]int
 	// 类
 	classes       []*classInfo
 	classNameToID map[string]int
@@ -413,6 +425,7 @@ type Compiler struct {
 	// 闭包编译支持：lambda block 形式
 	pendingClosures []*pendingClosure // 当前方法/函数体内收集的待编译闭包
 	captureStack    []*captureScope   // 嵌套闭包的捕获作用域链（栈顶=最内层）
+	curRetN         int               // 当前方法/闭包声明的返回值个数（默认 1）
 }
 
 // captureScope —— 闭包的捕获作用域：name → 本闭包内的 capture slot
@@ -428,6 +441,7 @@ type pendingClosure struct {
 	body       *ast.Node // NBlock
 	captures   []captureBinding
 	outerStack []*captureScope // 编译闭包体时的外层 captureStack 快照
+	retN       int             // 闭包内最大 return 值个数（多返回值支持，默认 1）
 }
 
 // captureBinding —— 闭包的一个捕获项
@@ -445,6 +459,7 @@ type methodInfo struct {
 	name       string
 	label      string
 	numParams  int
+	numRets    int // 声明的返回值个数（默认 1；由 parseMethod 的类型列表推导）
 	paramNames []string
 	node       *ast.Node // N_METHOD body node (Children[1] = block)
 }
@@ -473,6 +488,7 @@ type classMethod struct {
 	isStatic    bool
 	isAbstract  bool
 	numParams   int
+	numRets     int // 声明的返回值个数（默认 1）
 	paramNames  []string
 	body        *ast.Node
 	astNode     *ast.Node
@@ -486,7 +502,9 @@ func NewCompiler() *Compiler {
 		builder:       NewBuilder(),
 		methodLabels:  map[string]string{},
 		methodParams:  map[string]int{},
+		methodRets:    map[string]int{},
 		classNameToID: map[string]int{},
+		retCounts:     map[string]int{},
 	}
 }
 
@@ -522,8 +540,10 @@ func (c *Compiler) Compile(prog *ast.Node) *bytecode.Program {
 			callName := cl.name + "." + m.name
 			c.methodLabels[callName] = m.label
 			c.methodParams[m.label] = m.numParams
+			c.methodRets[m.label] = m.numRets
 			if _, ok := c.methodLabels[m.name]; !ok {
 				c.methodLabels[m.name] = m.label
+				c.methodRets[m.name] = m.numRets
 			}
 		}
 	}
@@ -662,6 +682,7 @@ func (c *Compiler) collectClassMembers(cl *classInfo, body *ast.Node) {
 				}
 			}
 			mm.numParams = len(mm.paramNames)
+			mm.numRets = methodDeclRets(m)
 			if len(m.Children) >= 2 {
 				mm.body = m.Children[1]
 			}
@@ -845,9 +866,22 @@ func (c *Compiler) collectMethod(n *ast.Node) {
 		}
 	}
 	info.numParams = len(info.paramNames)
+	info.numRets = methodDeclRets(n)
 	c.methods = append(c.methods, info)
 	c.methodLabels[name] = info.label
 	c.methodParams[info.label] = info.numParams
+	c.methodRets[info.label] = info.numRets
+}
+
+// methodDeclRets 返回 NMethod 声明的返回值个数（parseMethod 写入 n.IVal；无声明=1）
+func methodDeclRets(n *ast.Node) int {
+	if n == nil {
+		return 1
+	}
+	if n.IVal > 1 {
+		return int(n.IVal)
+	}
+	return 1
 }
 
 // ===== Stmt compilation =====
@@ -891,9 +925,22 @@ func (c *Compiler) compileStmt(n *ast.Node) {
 		}
 	case ast.NExprStmt:
 		if len(n.Children) >= 1 {
-			c.compileExpr(n.Children[0])
-			// 弹出表达式语句的值（丢弃）
-			c.builder.Pop()
+			child := n.Children[0]
+			if child != nil && child.Kind == ast.NCall {
+				// 调用作为语句：丢弃全部返回值（多返回值函数 R>1）
+				R := c.retsOf(child)
+				if R < 1 {
+					R = 1
+				}
+				c.compileExpr(child)
+				for i := 0; i < R; i++ {
+					c.builder.Pop()
+				}
+			} else {
+				c.compileExpr(child)
+				// 弹出表达式语句的值（丢弃）
+				c.builder.Pop()
+			}
 		}
 	case ast.NGo:
 		c.compileGoStmt(n)
@@ -901,6 +948,9 @@ func (c *Compiler) compileStmt(n *ast.Node) {
 		c.compileAssign(n)
 		// 赋值作为表达式编译后值保留在栈（供 NExprStmt 丢弃）；语句级 var 直接在此丢弃
 		c.builder.Pop()
+	case ast.NMultiAssign:
+		// 多目标赋值：var a, b = f()  /  a, b = f()
+		c.compileMultiAssign(n)
 	case ast.NAugAssign:
 		c.compileAugAssign(n)
 		// 复合赋值同理由表达式值保留 → 语句级丢弃
@@ -1170,12 +1220,39 @@ func (c *Compiler) leaveLoopLabels() {
 }
 
 func (c *Compiler) compileReturn(n *ast.Node) {
-	if len(n.Children) >= 1 && n.Children[0] != nil {
-		c.compileExpr(n.Children[0])
-	} else {
-		c.builder.PushI64(0)
+	retN := c.curRetN
+	if retN < 1 {
+		retN = 1
 	}
-	c.builder.Ret()
+	count := 0
+	if len(n.Children) >= 1 && n.Children[0] != nil {
+		child := n.Children[0]
+		if child.Kind == ast.NList {
+			// 多返回值：return a, b, c;
+			for _, e := range child.Children {
+				c.compileExpr(e)
+				count++
+			}
+		} else {
+			c.compileExpr(child)
+			count = 1
+		}
+	}
+	if count > retN {
+		// 多于声明：丢弃高位的多余值，仅保留 retN 个（v0 在底）
+		for i := count; i > retN; i-- {
+			c.builder.Pop()
+		}
+	} else {
+		for ; count < retN; count++ {
+			c.builder.PushI64(0)
+		}
+	}
+	if retN > 1 {
+		c.builder.RetN(uint8(retN))
+	} else {
+		c.builder.Ret()
+	}
 }
 
 // ===== Assignment =====
@@ -1186,8 +1263,16 @@ func (c *Compiler) compileAssign(n *ast.Node) {
 	}
 	lhs := n.Children[0]
 	rhs := n.Children[1]
-	// 先编译 RHS
-	c.compileExpr(rhs)
+	// 记录「名字 → 返回数」：把变量绑定到多返回 lambda 时，后续调用点 retsOf 可查
+	if rhs != nil && rhs.Kind == ast.NLambda && rhs.Text == "block" &&
+		lhs != nil && lhs.Kind == ast.NName {
+		if c.retCounts == nil {
+			c.retCounts = map[string]int{}
+		}
+		c.retCounts[lhs.Text] = lambdaRetCount(nth(rhs, 1))
+	}
+	// 先编译 RHS（保证只留 1 个主值）
+	c.compileRhs(rhs)
 	// 按 LHS 类型分派
 	switch lhs.Kind {
 	case ast.NName:
@@ -1277,6 +1362,109 @@ func (c *Compiler) compileAssign(n *ast.Node) {
 		c.builder.Pop()
 	default:
 		c.warnf("invalid assignment target: %s", ast.NodeKindName(lhs.Kind))
+		c.builder.Pop()
+	}
+}
+
+// compileRhs 编译 RHS 表达式并保证栈上恰好留下 1 个值：
+// 多返回值调用（声明 retN>1）时弹出多余的（R-1）个值，只保留 v0。
+func (c *Compiler) compileRhs(rhs *ast.Node) {
+	R := c.retsOf(rhs)
+	if R < 1 {
+		R = 1
+	}
+	c.compileExpr(rhs)
+	for i := 1; i < R; i++ {
+		c.builder.Pop()
+	}
+}
+
+// retsOf 估算一个调用表达式在运行时会压入几个返回值：
+//   - 方法调用：查 methodRets（按 label/名字）
+//   - 闭包变量/顶层变量：查 retCounts（绑定 lambda 时记录）
+//   - 字面量 lambda 直接调用：按其体内最大 return 值个数
+//   - 其他：默认 1
+func (c *Compiler) retsOf(expr *ast.Node) int {
+	if expr == nil || expr.Kind != ast.NCall || len(expr.Children) < 1 {
+		return 1
+	}
+	callee := expr.Children[0]
+	if callee.Kind == ast.NLambda && callee.Text == "block" {
+		if len(callee.Children) >= 2 {
+			return lambdaRetCount(callee.Children[1])
+		}
+		return 1
+	}
+	if callee.Kind == ast.NName {
+		if label, ok := c.methodLabels[callee.Text]; ok {
+			if r, ok := c.methodRets[label]; ok && r > 1 {
+				return r
+			}
+		}
+		if r, ok := c.methodRets[callee.Text]; ok && r > 1 {
+			return r
+		}
+		if r, ok := c.retCounts[callee.Text]; ok && r > 1 {
+			return r
+		}
+	}
+	return 1
+}
+
+// compileMultiAssign 编译多目标赋值（var a, b = f() 或 a, b = f()）。
+// 栈上 v0 在底、vN-1 在顶，目标按从左到右绑定 v0..；不足补 0，多余丢弃。
+func (c *Compiler) compileMultiAssign(n *ast.Node) {
+	if len(n.Children) < 2 {
+		return
+	}
+	lhsList := n.Children[0]
+	rhs := n.Children[1]
+	var targets []*ast.Node
+	if lhsList != nil {
+		for _, t := range lhsList.Children {
+			if t != nil {
+				targets = append(targets, t)
+			}
+		}
+	}
+	total := len(targets)
+	R := c.retsOf(rhs)
+	if R < 1 {
+		R = 1
+	}
+	c.compileExpr(rhs)
+	// 多余的高位值（v_total..v_{R-1}）在栈顶，先丢弃
+	for i := R; i > total; i-- {
+		c.builder.Pop()
+	}
+	// 自右向左把值绑定到目标（不足补 0）
+	for i := total - 1; i >= 0; i-- {
+		if i >= R {
+			c.builder.PushI64(0)
+		}
+		c.bindLHS(targets[i])
+	}
+}
+
+// bindLHS 弹出栈顶值并写入赋值目标（当前支持 NName：局部/捕获变量）。
+func (c *Compiler) bindLHS(lhs *ast.Node) {
+	if lhs == nil {
+		c.builder.Pop()
+		return
+	}
+	switch lhs.Kind {
+	case ast.NName:
+		for i := len(c.captureStack) - 1; i >= 0; i-- {
+			sc := c.captureStack[i]
+			if cs, ok := sc.nameToSlot[lhs.Text]; ok {
+				c.builder.StoreCapture(cs)
+				return
+			}
+		}
+		slot := c.localSlot(lhs.Text)
+		c.builder.StoreLocal(slot)
+	default:
+		c.warnf("multi-assign target %s not supported (skipped)", ast.NodeKindName(lhs.Kind))
 		c.builder.Pop()
 	}
 }
@@ -1679,7 +1867,40 @@ func (c *Compiler) compileLambdaBlock(n *ast.Node) {
 		body:       body,
 		captures:   caps,
 		outerStack: outerStackSnapshot,
+		retN:       lambdaRetCount(body),
 	})
+}
+
+// lambdaRetCount 统计一个闭包体（NBlock）内最大 return 值个数：
+// 遍历其直接域内 NReturn（不进入嵌套 lambda block），多值按 NList 长度。
+func lambdaRetCount(body *ast.Node) int {
+	maxR := 1
+	if body == nil {
+		return maxR
+	}
+	var walk func(nd *ast.Node)
+	walk = func(nd *ast.Node) {
+		if nd == nil {
+			return
+		}
+		if nd.Kind == ast.NLambda && nd.Text == "block" {
+			return // 嵌套闭包单独编译，不计入外层
+		}
+		if nd.Kind == ast.NReturn {
+			if len(nd.Children) >= 1 && nd.Children[0] != nil {
+				if nd.Children[0].Kind == ast.NList {
+					if n := len(nd.Children[0].Children); n > maxR {
+						maxR = n
+					}
+				}
+			}
+		}
+		for _, ch := range nd.Children {
+			walk(ch)
+		}
+	}
+	walk(body)
+	return maxR
 }
 
 // allocClosureID 分配编译期闭包 ID（仅用于命名 entryLabel，与运行时 closure_id 无关）
@@ -1728,9 +1949,16 @@ func (c *Compiler) compileClosureBody(pc *pendingClosure) {
 	savedLocals := c.currentLocals
 	savedNextSlot := c.nextSlot
 	savedCaptureStack := c.captureStack
+	savedRetN := c.curRetN
+	savedRetCounts := c.retCounts
 	// 建立新作用域
 	c.currentLocals = map[string]uint8{}
 	c.nextSlot = 0
+	c.curRetN = pc.retN
+	if c.curRetN < 1 {
+		c.curRetN = 1
+	}
+	c.retCounts = map[string]int{}
 	// params → slot 0..nparams-1
 	for i, pn := range pc.params {
 		c.currentLocals[pn] = uint8(i)
@@ -1751,13 +1979,14 @@ func (c *Compiler) compileClosureBody(pc *pendingClosure) {
 	// 编译闭包体
 	c.builder.Label(pc.entryLabel)
 	c.compileStmt(pc.body)
-	// 兜底 return 0
-	c.builder.PushI64(0)
-	c.builder.Ret()
+	// 兜底 return（按闭包返回值个数补 0）
+	c.emitImplicitReturn()
 	// 恢复外层上下文
 	c.currentLocals = savedLocals
 	c.nextSlot = savedNextSlot
 	c.captureStack = savedCaptureStack
+	c.curRetN = savedRetN
+	c.retCounts = savedRetCounts
 }
 
 // compileCall —— 支持：
@@ -2400,6 +2629,10 @@ func (c *Compiler) compileMethodBody(m *methodInfo) {
 	c.enterMethodScope()
 	c.insideMethod = true
 	c.numParams = m.numParams
+	c.curRetN = m.numRets
+	if c.curRetN < 1 {
+		c.curRetN = 1
+	}
 	// 参数名 → slot：param[0] → slot 0, param[1] → slot 1...
 	for i, pn := range m.paramNames {
 		c.currentLocals[pn] = uint8(i)
@@ -2415,9 +2648,8 @@ func (c *Compiler) compileMethodBody(m *methodInfo) {
 	if body != nil {
 		c.compileStmt(body)
 	}
-	// 方法无 return 时兜底：返回 0
-	c.builder.PushI64(0)
-	c.builder.Ret()
+	// 方法无 return 时兜底：按声明返回数补 0
+	c.emitImplicitReturn()
 	// 编译方法体内收集的闭包体
 	c.compilePendingClosures()
 	c.insideMethod = false
@@ -2430,10 +2662,31 @@ func (c *Compiler) compileMethodBody(m *methodInfo) {
 	c.builder.AddExport(m.name, int32(labelOffset(c.builder, m.label)), numLocals, uint8(m.numParams))
 }
 
+// emitImplicitReturn 在函数体末尾输出兜底 return（按 curRetN 补齐 0）
+func (c *Compiler) emitImplicitReturn() {
+	retN := c.curRetN
+	if retN < 1 {
+		retN = 1
+	}
+	if retN > 1 {
+		for i := 0; i < retN; i++ {
+			c.builder.PushI64(0)
+		}
+		c.builder.RetN(uint8(retN))
+	} else {
+		c.builder.PushI64(0)
+		c.builder.Ret()
+	}
+}
+
 func (c *Compiler) compileClassMethodBody(cl *classInfo, m *classMethod) {
 	c.enterMethodScope()
 	c.insideMethod = true
 	c.numParams = m.numParams
+	c.curRetN = m.numRets
+	if c.curRetN < 1 {
+		c.curRetN = 1
+	}
 	// 非静态方法：slot 0 = this，之后才是 params
 	baseSlot := uint8(0)
 	if !m.isStatic {
@@ -2454,8 +2707,8 @@ func (c *Compiler) compileClassMethodBody(cl *classInfo, m *classMethod) {
 	if m.body != nil {
 		c.compileStmt(m.body)
 	}
-	c.builder.PushI64(0)
-	c.builder.Ret()
+	// 类方法无 return 时兜底：按声明返回数补 0
+	c.emitImplicitReturn()
 	// 编译类方法体内收集的闭包体
 	c.compilePendingClosures()
 	m.numLocals = c.nextSlot

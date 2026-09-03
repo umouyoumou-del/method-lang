@@ -52,6 +52,10 @@ const (
 	NBinary // 二元运算
 	NGo     // go 语句：children[0]=方法名, children[1]=参数列表
 	NFinally
+	// Go 特性集成：
+	NMultiAssign // 多返回值同时赋值：children[0]=NList of LHS(NName), children[1]=RHS expr
+	NForRange    // for [k,] v in range iter { body }：children[0]=key(NName|nil), [1]=val(NName), [2]=iter, [3]=body
+	NDefer       // defer call：children[0]=被延迟的调用表达式
 )
 
 // NodeKindName 返回节点种类的可读名称
@@ -64,7 +68,7 @@ func NodeKindName(k NodeKind) string {
 		"Lambda", "Yield", "Unary", "Compare", "Call",
 		"Index", "Member", "Name", "Int", "Float", "String", "Bool",
 		"Null", "This", "ListExpr", "New", "InstanceOf", "Super", "Interface",
-		"Binary", "Go", "Finally",
+		"Binary", "Go", "Finally", "MultiAssign", "ForRange", "Defer",
 	}
 	if int(k) >= 0 && int(k) < len(names) {
 		return names[k]
