@@ -99,6 +99,16 @@ type Object struct {
 	Fields   []int64
 }
 
+// Closure —— lambda block 形式闭包：entryPC + 捕获的外层变量快照
+type Closure struct {
+	EntryPC  int32
+	NParams  uint8
+	NLocals  uint8
+	NCapture uint8
+	Captures []int64
+	RefCount int32
+}
+
 type ClassRegistry struct {
 	classes    []ClassMeta
 	nameToID   map[string]int32
@@ -368,6 +378,12 @@ type Interpreter struct {
 	listFree []int32
 	dicts    []map[string]int64
 	dictFree []int32
+	// 指针表（ref-cell 模型：&x 复制值到指针表，*p 读写指针表）
+	ptrs    []int64
+	ptrFree []int32
+	// 闭包表（lambda block 形式：捕获外层 local 值的快照）
+	closures    []Closure
+	closureFree []int32
 	// HTTP 全局配置
 	httpClient  *http.Client
 	httpUA      string
@@ -384,6 +400,16 @@ type Interpreter struct {
 	isRoot bool // 根线程在结束时等待所有 go 子线程
 	// 异常处理：handler 栈（try 进入时压入，正常结束/Ret 弹出）
 	handlers []handlerFrame
+	// GC 垃圾回收（标记-清扫，保守式）
+	gcThreshold  int     // 触发阈值（分配次数）
+	gcAllocCount int     // 自上次 GC 以来的分配计数
+	gcMarked     []bool  // 对象标记位图
+	gcListMarked []bool  // 列表标记位图
+	gcDictMarked []bool  // 字典标记位图
+	gcPtrMarked  []bool  // 指针标记位图
+	gcClosureMarked []bool // 闭包标记位图
+	gcDisabled   bool    // GC 关闭标志（构造函数执行期间临时关闭）
+	gcStats      GCStats // 统计
 }
 
 // Chan —— 跨线程缓冲通道（Go 风格；满发送阻塞 / 空接收阻塞）
@@ -464,6 +490,7 @@ func (s *Shared) chanGet(id int64) (int64, bool) {
 type savedFrame struct {
 	saved         [256]int64
 	pendingNewObj int32 // >=0 表示当前帧是构造函数调用，Ret 时用 objID 替换 retval 压栈
+	closureID     int32 // >=0 表示当前帧是闭包调用，OpLoadCapture/StoreCapture 据此定位
 }
 
 // handlerFrame —— try 块进入时的快照（异常处理目标）
@@ -472,6 +499,16 @@ type handlerFrame struct {
 	sp        int // try 进入时的操作数栈深度
 	csLen     int // try 进入时的 callStack 深度
 	framesLen int // try 进入时的 frames 深度（用于 Ret 时判定 handler 归属 / 跨帧恢复）
+}
+
+// GCStats —— GC 统计信息
+type GCStats struct {
+	TotalRuns     int   // GC 总运行次数
+	LastFreed     int   // 上次回收的对象数
+	LastListFreed int   // 上次回收的列表数
+	LastDictFreed int   // 上次回收的字典数
+	LastMarkTime  int64 // 上次标记阶段纳秒
+	LastSweepTime int64 // 上次清扫阶段纳秒
 }
 
 func NewInterpreter() *Interpreter {
@@ -486,6 +523,8 @@ func NewInterpreter() *Interpreter {
 		objects:  make([]Object, 1), // index 0 reserved (null)
 		lists:    make([][]int64, 1),
 		dicts:    make([]map[string]int64, 1),
+		ptrs:     make([]int64, 1),
+		closures: make([]Closure, 1), // index 0 reserved (invalid closure)
 		Output:   os.Stdout,
 		MaxSteps: 1 << 30,
 		Trace:    os.Getenv("METHOD_TRACE") != "",
@@ -499,6 +538,7 @@ func NewInterpreter() *Interpreter {
 		httpUA:      "method/1.0",
 		httpHdrs:    map[string]string{},
 		httpCookies: map[string]string{},
+		gcThreshold: 200, // 每 200 次分配自动触发一次 GC
 	}
 }
 
@@ -1063,6 +1103,165 @@ func (vm *Interpreter) runCode(prog *bytecode.Program, startPC int) (st Status, 
 			}
 			return StatusUncaught, fmt.Errorf("uncaught exception: %s", msg)
 
+		// ===== GC 垃圾回收 =====
+		case bytecode.OpGC:
+			freed := vm.gcRun()
+			vm.push(int64(freed))
+
+		// ===== 指针操作 =====
+		case bytecode.OpAddrOf:
+			if pc >= len(code) {
+				return StatusTruncated, nil
+			}
+			slot := code[pc]
+			pc++
+			pid := vm.ptrAlloc()
+			vm.ptrs[pid] = vm.locals[slot]
+			vm.push(int64(pid))
+		case bytecode.OpDerefLoad:
+			pid, err := vm.pop()
+			if err != nil {
+				return StatusStackUnderflow, err
+			}
+			if pid <= 0 || int(pid) >= len(vm.ptrs) {
+				vm.push(0)
+			} else {
+				vm.push(vm.ptrs[pid])
+			}
+		case bytecode.OpDerefStore:
+			val, err := vm.pop()
+			if err != nil {
+				return StatusStackUnderflow, err
+			}
+			pid, err := vm.pop()
+			if err != nil {
+				return StatusStackUnderflow, err
+			}
+			if pid > 0 && int(pid) < len(vm.ptrs) {
+				vm.ptrs[pid] = val
+			}
+			vm.push(val)
+
+		// ===== 闭包（lambda block 形式）=====
+		case bytecode.OpClosureNew:
+			// 布局：[op][i32 entryPC][u8 nparams][u8 nlocals][u8 ncapture]
+			// 栈：[cap0..capN-1]（cap0 在底）→ [closure_id]
+			if pc+4+3 > len(code) {
+				return StatusTruncated, nil
+			}
+			entryPC := int(binary.LittleEndian.Uint32(code[pc : pc+4]))
+			pc += 4
+			nparams := code[pc]
+			pc++
+			nlocals := code[pc]
+			pc++
+			ncapture := code[pc]
+			pc++
+			caps := make([]int64, ncapture)
+			// 反向弹栈：栈顶是 capN-1
+			for i := int(ncapture) - 1; i >= 0; i-- {
+				v, err := vm.pop()
+				if err != nil {
+					return StatusStackUnderflow, err
+				}
+				caps[i] = v
+			}
+			cid := vm.closureAlloc()
+			vm.closures[cid].EntryPC = int32(entryPC)
+			vm.closures[cid].NParams = nparams
+			vm.closures[cid].NLocals = nlocals
+			vm.closures[cid].NCapture = ncapture
+			vm.closures[cid].Captures = caps
+			vm.push(int64(cid))
+		case bytecode.OpClosureCall:
+			// 栈序（底→顶）：[arg0..argM-1, argc, closure_id] → 结果留栈顶
+			cid, err := vm.pop()
+			if err != nil {
+				return StatusStackUnderflow, err
+			}
+			argc, err := vm.pop()
+			if err != nil {
+				return StatusStackUnderflow, err
+			}
+			if argc < 0 || argc > 127 {
+				return StatusInvalidArgc, fmt.Errorf("invalid argc %d", argc)
+			}
+			if cid <= 0 || int(cid) >= len(vm.closures) || vm.closures[cid].RefCount <= 0 {
+				// 无效闭包：弹掉参数，压 0
+				for i := int64(0); i < argc; i++ {
+					vm.pop()
+				}
+				vm.push(0)
+				break
+			}
+			cl := vm.closures[cid]
+			args := make([]int64, argc)
+			for i := argc - 1; i >= 0; i-- {
+				v, perr := vm.pop()
+				if perr != nil {
+					return StatusStackUnderflow, perr
+				}
+				args[i] = v
+			}
+			vm.saveFrame()
+			vm.frames[len(vm.frames)-1].closureID = int32(cid)
+			// args → locals[0..argc-1]（按 nparams 截断）
+			for i := int64(0); i < argc && i < int64(cl.NParams); i++ {
+				vm.locals[i] = args[i]
+			}
+			// captures → locals[nparams..nparams+ncapture-1]
+			for i := uint8(0); i < cl.NCapture; i++ {
+				slot := cl.NParams + i
+				if int(slot) < 256 {
+					vm.locals[slot] = cl.Captures[i]
+				}
+			}
+			vm.callStack = append(vm.callStack, pc)
+			pc = int(cl.EntryPC)
+		case bytecode.OpLoadCapture:
+			// 布局：[op][u8 slot]
+			if pc >= len(code) {
+				return StatusTruncated, nil
+			}
+			slot := code[pc]
+			pc++
+			// 从当前帧的 closureID 取 captures[slot]
+			cid := int32(-1)
+			if len(vm.frames) > 0 {
+				cid = vm.frames[len(vm.frames)-1].closureID
+			}
+			if cid < 0 || int(cid) >= len(vm.closures) || vm.closures[cid].RefCount <= 0 {
+				vm.push(0)
+			} else {
+				cl := &vm.closures[cid]
+				if int(slot) < len(cl.Captures) {
+					vm.push(cl.Captures[slot])
+				} else {
+					vm.push(0)
+				}
+			}
+		case bytecode.OpStoreCapture:
+			// 布局：[op][u8 slot]，栈：[v] → []
+			if pc >= len(code) {
+				return StatusTruncated, nil
+			}
+			slot := code[pc]
+			pc++
+			val, err := vm.pop()
+			if err != nil {
+				return StatusStackUnderflow, err
+			}
+			cid := int32(-1)
+			if len(vm.frames) > 0 {
+				cid = vm.frames[len(vm.frames)-1].closureID
+			}
+			if cid >= 0 && int(cid) < len(vm.closures) && vm.closures[cid].RefCount > 0 {
+				cl := &vm.closures[cid]
+				if int(slot) < len(cl.Captures) {
+					cl.Captures[slot] = val
+				}
+			}
+
 		// ===== 列表容器 =====
 		case bytecode.OpListNew:
 			id, err := vm.listAlloc()
@@ -1567,6 +1766,7 @@ func (vm *Interpreter) saveFrame() {
 	var f savedFrame
 	copy(f.saved[:], vm.locals[0:256])
 	f.pendingNewObj = -1 // 默认：非构造函数帧
+	f.closureID = -1     // 默认：非闭包帧
 	vm.frames = append(vm.frames, f)
 }
 func (vm *Interpreter) restoreFrame() {
@@ -1687,6 +1887,7 @@ func (vm *Interpreter) strIntern(s string) int64 {
 
 // listAlloc 分配新列表 id（复用 free slot，否则追加）
 func (vm *Interpreter) listAlloc() (int64, error) {
+	vm.gcMaybeTrigger()
 	if len(vm.listFree) > 0 {
 		id := vm.listFree[len(vm.listFree)-1]
 		vm.listFree = vm.listFree[:len(vm.listFree)-1]
@@ -1700,6 +1901,7 @@ func (vm *Interpreter) listAlloc() (int64, error) {
 
 // dictAlloc 分配新字典 id
 func (vm *Interpreter) dictAlloc() (int64, error) {
+	vm.gcMaybeTrigger()
 	if len(vm.dictFree) > 0 {
 		id := vm.dictFree[len(vm.dictFree)-1]
 		vm.dictFree = vm.dictFree[:len(vm.dictFree)-1]
@@ -1711,7 +1913,22 @@ func (vm *Interpreter) dictAlloc() (int64, error) {
 	return int64(id), nil
 }
 
+// ptrAlloc 分配新指针单元格 id
+func (vm *Interpreter) ptrAlloc() int32 {
+	vm.gcMaybeTrigger()
+	if len(vm.ptrFree) > 0 {
+		id := vm.ptrFree[len(vm.ptrFree)-1]
+		vm.ptrFree = vm.ptrFree[:len(vm.ptrFree)-1]
+		vm.ptrs[id] = 0
+		return id
+	}
+	id := int32(len(vm.ptrs))
+	vm.ptrs = append(vm.ptrs, 0)
+	return id
+}
+
 func (vm *Interpreter) objAlloc(classID int32) int32 {
+	vm.gcMaybeTrigger()
 	var obj Object
 	obj.ClassID = classID
 	obj.RefCount = 1
@@ -1727,6 +1944,21 @@ func (vm *Interpreter) objAlloc(classID int32) int32 {
 	} else {
 		id = int32(len(vm.objects))
 		vm.objects = append(vm.objects, obj)
+	}
+	return id
+}
+
+// closureAlloc 分配新闭包 id（复用 free slot，否则追加）
+func (vm *Interpreter) closureAlloc() int32 {
+	vm.gcMaybeTrigger()
+	var id int32
+	if len(vm.closureFree) > 0 {
+		id = vm.closureFree[len(vm.closureFree)-1]
+		vm.closureFree = vm.closureFree[:len(vm.closureFree)-1]
+		vm.closures[id].RefCount = 1
+	} else {
+		id = int32(len(vm.closures))
+		vm.closures = append(vm.closures, Closure{RefCount: 1})
 	}
 	return id
 }
@@ -1746,6 +1978,255 @@ func (vm *Interpreter) objRelease(id int32) {
 		o.ClassID = -1
 		o.Fields = nil
 		vm.freeSlots = append(vm.freeSlots, id)
+	}
+}
+
+// ============================================================
+//  GC 垃圾回收（标记-清扫，保守式）
+// ============================================================
+
+// gcRun 执行一次完整的 GC 周期：标记根集 → 递归追踪 → 清扫未标记对象
+// 返回回收的对象总数
+func (vm *Interpreter) gcRun() int {
+	if vm.gcDisabled {
+		return 0
+	}
+
+	nObj := len(vm.objects)
+	if vm.Trace {
+		fmt.Fprintf(vm.Output, "[GC] nObj=%d nList=%d nDict=%d nPtr=%d nClosure=%d sp=%d frames=%d\n",
+			nObj, len(vm.lists), len(vm.dicts), len(vm.ptrs), len(vm.closures), vm.sp, len(vm.frames))
+	}
+	nList := len(vm.lists)
+	nDict := len(vm.dicts)
+	nPtr := len(vm.ptrs)
+	nClosure := len(vm.closures)
+
+	// 确保标记位图够大
+	if cap(vm.gcMarked) < nObj {
+		vm.gcMarked = make([]bool, nObj)
+	} else {
+		vm.gcMarked = vm.gcMarked[:nObj]
+	}
+	if cap(vm.gcListMarked) < nList {
+		vm.gcListMarked = make([]bool, nList)
+	} else {
+		vm.gcListMarked = vm.gcListMarked[:nList]
+	}
+	if cap(vm.gcDictMarked) < nDict {
+		vm.gcDictMarked = make([]bool, nDict)
+	} else {
+		vm.gcDictMarked = vm.gcDictMarked[:nDict]
+	}
+	if cap(vm.gcPtrMarked) < nPtr {
+		vm.gcPtrMarked = make([]bool, nPtr)
+	} else {
+		vm.gcPtrMarked = vm.gcPtrMarked[:nPtr]
+	}
+	if cap(vm.gcClosureMarked) < nClosure {
+		vm.gcClosureMarked = make([]bool, nClosure)
+	} else {
+		vm.gcClosureMarked = vm.gcClosureMarked[:nClosure]
+	}
+	// 重置标记
+	for i := range vm.gcMarked {
+		vm.gcMarked[i] = false
+	}
+	for i := range vm.gcListMarked {
+		vm.gcListMarked[i] = false
+	}
+	for i := range vm.gcDictMarked {
+		vm.gcDictMarked[i] = false
+	}
+	for i := range vm.gcPtrMarked {
+		vm.gcPtrMarked[i] = false
+	}
+	for i := range vm.gcClosureMarked {
+		vm.gcClosureMarked[i] = false
+	}
+
+	// ---- 标记阶段：从根集出发 ----
+	// 根 1: 操作数栈
+	for i := 0; i < vm.sp; i++ {
+		vm.gcMarkValue(vm.stack[i])
+	}
+	// 根 2: 局部变量
+	for i := 0; i < 256; i++ {
+		if vm.Trace && vm.locals[i] != 0 {
+			fmt.Fprintf(vm.Output, "[GC] local[%d] = %d\n", i, vm.locals[i])
+		}
+		vm.gcMarkValue(vm.locals[i])
+	}
+	// 根 3: 保存的调用帧局部变量
+	for _, f := range vm.frames {
+		for i := 0; i < 256; i++ {
+			vm.gcMarkValue(f.saved[i])
+		}
+		if f.pendingNewObj >= 0 {
+			vm.gcMarkValue(int64(f.pendingNewObj))
+		}
+		if f.closureID >= 0 {
+			vm.gcMarkValue(int64(f.closureID))
+		}
+	}
+	// 根 4: 静态字段
+	for cid := int32(0); cid < int32(len(vm.classes.classes)); cid++ {
+		cm := vm.classes.Find(cid)
+		sv := vm.classes.StaticValues(cid)
+		if sv != nil {
+			if vm.Trace && len(*sv) > 0 {
+				name := ""
+				if cm != nil {
+					name = cm.Name
+				}
+				fmt.Fprintf(vm.Output, "[GC] static fields class %d (%s): %v\n", cid, name, *sv)
+			}
+			for _, v := range *sv {
+				vm.gcMarkValue(v)
+			}
+		}
+	}
+
+	// ---- 清扫阶段 ----
+	freedObj := 0
+	freedList := 0
+	freedDict := 0
+	freedPtr := 0
+	freedClosure := 0
+
+	for i := 1; i < nObj; i++ {
+		o := &vm.objects[i]
+		if o.ClassID < 0 {
+			continue // 已释放的空槽
+		}
+		if !vm.gcMarked[i] {
+			o.ClassID = -1
+			o.Fields = nil
+			vm.freeSlots = append(vm.freeSlots, int32(i))
+			freedObj++
+		}
+	}
+	for i := 1; i < nList; i++ {
+		if vm.lists[i] == nil {
+			continue
+		}
+		if !vm.gcListMarked[i] {
+			vm.lists[i] = nil
+			vm.listFree = append(vm.listFree, int32(i))
+			freedList++
+		}
+	}
+	for i := 1; i < nDict; i++ {
+		if vm.dicts[i] == nil {
+			continue
+		}
+		if !vm.gcDictMarked[i] {
+			vm.dicts[i] = nil
+			vm.dictFree = append(vm.dictFree, int32(i))
+			freedDict++
+		}
+	}
+	for i := 1; i < nPtr; i++ {
+		if !vm.gcPtrMarked[i] {
+			vm.ptrs[i] = 0
+			vm.ptrFree = append(vm.ptrFree, int32(i))
+			freedPtr++
+		}
+	}
+	for i := 1; i < nClosure; i++ {
+		if vm.closures[i].RefCount <= 0 {
+			continue // 已回收的空槽
+		}
+		if !vm.gcClosureMarked[i] {
+			vm.closures[i].RefCount = 0
+			vm.closures[i].Captures = nil
+			vm.closureFree = append(vm.closureFree, int32(i))
+			freedClosure++
+		}
+	}
+
+	// 更新统计
+	vm.gcStats.TotalRuns++
+	vm.gcStats.LastFreed = freedObj
+	vm.gcStats.LastListFreed = freedList
+	vm.gcStats.LastDictFreed = freedDict
+	vm.gcAllocCount = 0
+
+	if vm.Trace {
+		fmt.Fprintf(vm.Output, "[GC] swept: obj=%d list=%d dict=%d ptr=%d closure=%d\n", freedObj, freedList, freedDict, freedPtr, freedClosure)
+	}
+
+	return freedObj + freedList + freedDict + freedPtr + freedClosure
+}
+
+// gcMarkValue 保守式标记：将值视为潜在的对象/列表/字典 ID 尝试标记
+func (vm *Interpreter) gcMarkValue(v int64) {
+	if v <= 0 {
+		return
+	}
+	uid := int32(v)
+	// 尝试标记对象
+	if int(uid) < len(vm.gcMarked) {
+		o := &vm.objects[uid]
+		if o.ClassID >= 0 && !vm.gcMarked[uid] {
+			vm.gcMarked[uid] = true
+			if vm.Trace {
+				fmt.Fprintf(vm.Output, "[GC] mark obj %d (class=%d fields=%d)\n", uid, o.ClassID, len(o.Fields))
+			}
+			// 递归标记对象的字段
+			for _, f := range o.Fields {
+				vm.gcMarkValue(f)
+			}
+		}
+	}
+	// 尝试标记列表
+	if int(uid) < len(vm.gcListMarked) {
+		if vm.lists[uid] != nil && !vm.gcListMarked[uid] {
+			vm.gcListMarked[uid] = true
+			for _, e := range vm.lists[uid] {
+				vm.gcMarkValue(e)
+			}
+		}
+	}
+	// 尝试标记字典
+	if int(uid) < len(vm.gcDictMarked) {
+		if vm.dicts[uid] != nil && !vm.gcDictMarked[uid] {
+			vm.gcDictMarked[uid] = true
+			for _, val := range vm.dicts[uid] {
+				vm.gcMarkValue(val)
+			}
+		}
+	}
+	// 尝试标记指针
+	if int(uid) < len(vm.gcPtrMarked) {
+		if !vm.gcPtrMarked[uid] {
+			vm.gcPtrMarked[uid] = true
+			vm.gcMarkValue(vm.ptrs[uid])
+		}
+	}
+	// 尝试标记闭包（id 合法且存活 → 递归标记其捕获的 Captures）
+	if int(uid) < len(vm.gcClosureMarked) {
+		cl := &vm.closures[uid]
+		if cl.RefCount > 0 && !vm.gcClosureMarked[uid] {
+			vm.gcClosureMarked[uid] = true
+			if vm.Trace {
+				fmt.Fprintf(vm.Output, "[GC] mark closure %d (captures=%d)\n", uid, len(cl.Captures))
+			}
+			for _, c := range cl.Captures {
+				vm.gcMarkValue(c)
+			}
+		}
+	}
+}
+
+// gcMaybeTrigger 在每次分配时调用，达到阈值则自动触发 GC
+func (vm *Interpreter) gcMaybeTrigger() {
+	if vm.gcDisabled || vm.gcThreshold <= 0 {
+		return
+	}
+	vm.gcAllocCount++
+	if vm.gcAllocCount >= vm.gcThreshold {
+		vm.gcRun()
 	}
 }
 

@@ -1067,7 +1067,7 @@ func (p *Parser) parseVarDecl() *ast.Node {
 	} else {
 		rhs = ast.New(ast.NInt, "0", line)
 	}
-	n := ast.New(ast.NAssign, "=", line)
+	n := ast.New(ast.NAssign, "var", line)
 	n.Add(name)
 	n.Add(rhs)
 	p.acceptRune(';')
@@ -1084,12 +1084,9 @@ func (p *Parser) parseExpr() *ast.Node {
 // assignment = yield_expr | lambda | or_expr (('=' | aug_op) assignment)?
 func (p *Parser) parseAssignment() *ast.Node {
 	line := p.line()
-	// 先判断 yield/lambda 以避免与 or_expr 混淆
+	// 先判断 yield 以避免与 or_expr 混淆
 	if p.isKind(lexer.TYield) {
 		return p.parseYield()
-	}
-	if p.isKind(lexer.TLambda) {
-		return p.parseLambda()
 	}
 	left := p.parseOrExpr()
 	if left == nil {
@@ -1144,6 +1141,46 @@ func (p *Parser) parseLambda() *ast.Node {
 	line := p.line()
 	p.advance()
 	params := ast.New(ast.NList, "params", line)
+	// block 形式：lambda(params) { block } 或 lambda { block }
+	if p.isRune('{') {
+		// 无参 block 形式：lambda { block }
+		body := p.parseBlock()
+		n := ast.New(ast.NLambda, "block", line)
+		n.Add(params)
+		n.Add(body)
+		return n
+	}
+	if p.isRune('(') {
+		// 可能是 (params) { block } 或 (params) : expr
+		p.advance()
+		for !p.isRune(')') && !p.isKind(lexer.TEOF) {
+			t := p.expect(lexer.TName, "lambda parameter name")
+			if t == nil {
+				break
+			}
+			params.Add(ast.New(ast.NName, t.Text, t.Line))
+			if !p.acceptRune(',') {
+				break
+			}
+		}
+		p.expectRune(')', "')' to close lambda parameter list")
+		if p.isRune('{') {
+			// (params) { block }
+			body := p.parseBlock()
+			n := ast.New(ast.NLambda, "block", line)
+			n.Add(params)
+			n.Add(body)
+			return n
+		}
+		// (params) : expr —— 走原单表达式路径
+		p.expectRune(':', "':' in lambda")
+		body := p.parseExpr()
+		n := ast.New(ast.NLambda, "", line)
+		n.Add(params)
+		n.Add(body)
+		return n
+	}
+	// 原单表达式形式：lambda params: expr
 	if !p.isRune(':') {
 		for {
 			t := p.expect(lexer.TName, "lambda parameter name")
@@ -1319,7 +1356,7 @@ func (p *Parser) parseMultiplicative() *ast.Node {
 	return left
 }
 
-// unary = ('-' | '+' | 'del' | 'await') unary | postfix
+// unary = ('-' | '+' | '&' | '*' | 'del' | 'await') unary | postfix
 func (p *Parser) parseUnary() *ast.Node {
 	line := p.line()
 	switch p.cur().Kind {
@@ -1333,6 +1370,20 @@ func (p *Parser) parseUnary() *ast.Node {
 		p.advance()
 		operand := p.parseUnary()
 		n := ast.New(ast.NUnary, "+", line)
+		n.Add(operand)
+		return n
+	case lexer.TokenKind('&'):
+		// &x — 取地址（指针）
+		p.advance()
+		operand := p.parseUnary()
+		n := ast.New(ast.NUnary, "&", line)
+		n.Add(operand)
+		return n
+	case lexer.TokenKind('*'):
+		// *p — 解引用（仅在 unary 位置识别，不影响乘法）
+		p.advance()
+		operand := p.parseUnary()
+		n := ast.New(ast.NUnary, "*", line)
 		n.Add(operand)
 		return n
 	case lexer.TDel:
@@ -1493,6 +1544,9 @@ func (p *Parser) parsePrimary() *ast.Node {
 	case lexer.TTrue:
 		p.advance()
 		return ast.NewBool(true, t.Line)
+	case lexer.TLambda:
+		// lambda 在 primary 位置识别，使其后可跟 postfix（立即调用等）
+		return p.parseLambda()
 	case lexer.TFalse:
 		p.advance()
 		return ast.NewBool(false, t.Line)

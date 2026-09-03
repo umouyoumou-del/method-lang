@@ -16,6 +16,7 @@ type Builder struct {
 	code             []byte
 	labels           map[string]int
 	forwardRefs      map[string][]int // label name -> list of code offsets to patch (jump offset field position)
+	closureRefs      map[string][]int // label name -> list of code offsets to patch (absolute entryPC for OpClosureNew)
 	methodBlockStart uint32
 	exports          []bytecode.Export
 	pseudo           []byte
@@ -48,6 +49,7 @@ func NewBuilder() *Builder {
 	b := &Builder{
 		labels:      map[string]int{},
 		forwardRefs: map[string][]int{},
+		closureRefs: map[string][]int{},
 		strTable:    []string{""},
 		strIndex:    map[string]int{"": 0},
 	}
@@ -159,8 +161,12 @@ func (b *Builder) ChanNew() { b.emit(bytecode.OpChanNew) }
 func (b *Builder) ChanPut() { b.emit(bytecode.OpChanPut) }
 func (b *Builder) ChanGet() { b.emit(bytecode.OpChanGet) }
 
-func (b *Builder) SystemExec()     { b.emit(bytecode.OpSystemExec) }
-func (b *Builder) SystemReadFile() { b.emit(bytecode.OpSystemReadFile) }
+func (b *Builder) SystemExec()       { b.emit(bytecode.OpSystemExec) }
+func (b *Builder) SystemReadFile()   { b.emit(bytecode.OpSystemReadFile) }
+func (b *Builder) GC()               { b.emit(bytecode.OpGC) }
+func (b *Builder) AddrOf(slot uint8) { b.emit(bytecode.OpAddrOf); b.emitU8(slot) }
+func (b *Builder) DerefLoad()        { b.emit(bytecode.OpDerefLoad) }
+func (b *Builder) DerefStore()       { b.emit(bytecode.OpDerefStore) }
 
 // ===== 容器指令 =====
 func (b *Builder) ListNew()      { b.emit(bytecode.OpListNew) }
@@ -211,15 +217,20 @@ func (b *Builder) CodeSize() int { return len(b.code) }
 func (b *Builder) Label(name string) {
 	off := len(b.code)
 	b.labels[name] = off
-	// 回填前向引用
+	// 回填前向引用（相对跳转 offset）
 	if refs, ok := b.forwardRefs[name]; ok {
 		for _, at := range refs {
-			// 跳转指令结构：[op(1)] [i32 offset(4)]，offset 字段位置=at
-			// offset = target - (at + 4) 即 target = 指令末尾之后的位置
 			patchVal := int32(off - (at + 4))
 			b.patchOffset(at, patchVal)
 		}
 		delete(b.forwardRefs, name)
+	}
+	// 回填闭包 entryPC（绝对偏移）
+	if crefs, ok := b.closureRefs[name]; ok {
+		for _, at := range crefs {
+			b.patchOffset(at, int32(off))
+		}
+		delete(b.closureRefs, name)
 	}
 }
 
@@ -249,7 +260,28 @@ func (b *Builder) JnzTo(name string) { b.emitJumpTo(bytecode.OpJnz, name) }
 // 异常处理：PushHandlerTo 支持前向标签回填（布局 [op][i32] 与跳转一致）
 func (b *Builder) PushHandlerTo(name string) { b.emitJumpTo(bytecode.OpPushHandler, name) }
 func (b *Builder) PopHandler()               { b.emit(bytecode.OpPopHandler) }
-func (b *Builder) Raise()                    { b.emit(bytecode.OpRaise) }
+
+// 闭包：ClosureNewTo 支持前向标签回填（entryPC 为绝对偏移）
+// 布局：[OpClosureNew(1)][i32 entryPC(4)][u8 nparams][u8 nlocals][u8 ncapture]
+func (b *Builder) ClosureNewTo(name string, nparams, nlocals, ncapture uint8) {
+	b.emit(bytecode.OpClosureNew)
+	at := len(b.code) // entryPC 占位位置
+	b.emitI32(0)
+	b.emitU8(nparams)
+	b.emitU8(nlocals)
+	b.emitU8(ncapture)
+	// 若标签已定义，直接写入绝对偏移
+	if off, ok := b.labels[name]; ok {
+		b.patchOffset(at, int32(off))
+		return
+	}
+	// 否则加入 closureRefs 等待回填
+	b.closureRefs[name] = append(b.closureRefs[name], at)
+}
+func (b *Builder) ClosureCall()            { b.emit(bytecode.OpClosureCall) }
+func (b *Builder) LoadCapture(slot uint8)  { b.emit(bytecode.OpLoadCapture); b.emitU8(slot) }
+func (b *Builder) StoreCapture(slot uint8) { b.emit(bytecode.OpStoreCapture); b.emitU8(slot) }
+func (b *Builder) Raise()                  { b.emit(bytecode.OpRaise) }
 
 func (b *Builder) SetMethodBlockStart(off uint32) { b.methodBlockStart = off }
 func (b *Builder) MethodBlockStart() uint32       { return b.methodBlockStart }
@@ -378,6 +410,35 @@ type Compiler struct {
 	insideMethod  bool
 	warnings      []string
 	errors        []string
+	// 闭包编译支持：lambda block 形式
+	pendingClosures []*pendingClosure // 当前方法/函数体内收集的待编译闭包
+	captureStack    []*captureScope   // 嵌套闭包的捕获作用域链（栈顶=最内层）
+}
+
+// captureScope —— 闭包的捕获作用域：name → 本闭包内的 capture slot
+type captureScope struct {
+	nameToSlot map[string]uint8
+	outer      *captureScope
+}
+
+// pendingClosure —— 待编译的闭包体
+type pendingClosure struct {
+	entryLabel string
+	params     []string
+	body       *ast.Node // NBlock
+	captures   []captureBinding
+	outerStack []*captureScope // 编译闭包体时的外层 captureStack 快照
+}
+
+// captureBinding —— 闭包的一个捕获项
+// source: 0=来自外层方法 locals（LoadLocal(outerSlot)）
+//
+//	1=来自外层闭包 capture（OpLoadCapture(outerSlot)）
+type captureBinding struct {
+	name      string
+	slot      uint8 // 本闭包内的 capture slot 索引
+	outerSlot uint8 // 外层槽位（locals slot 或 capture slot）
+	source    int   // 0=method locals, 1=outer closure capture
 }
 
 type methodInfo struct {
@@ -479,6 +540,8 @@ func (c *Compiler) Compile(prog *ast.Node) *bytecode.Program {
 		}
 		c.compileStmt(s)
 	}
+	// 编译顶层代码中收集的闭包体（在 Halt 之前，避免被执行流穿越）
+	c.compilePendingClosures()
 	c.builder.Halt()
 	c.builder.SetMethodBlockStart(uint32(c.builder.CodeSize()))
 
@@ -836,8 +899,12 @@ func (c *Compiler) compileStmt(n *ast.Node) {
 		c.compileGoStmt(n)
 	case ast.NAssign:
 		c.compileAssign(n)
+		// 赋值作为表达式编译后值保留在栈（供 NExprStmt 丢弃）；语句级 var 直接在此丢弃
+		c.builder.Pop()
 	case ast.NAugAssign:
 		c.compileAugAssign(n)
+		// 复合赋值同理由表达式值保留 → 语句级丢弃
+		c.builder.Pop()
 	case ast.NTry:
 		c.compileTry(n)
 	case ast.NRaise:
@@ -1124,7 +1191,19 @@ func (c *Compiler) compileAssign(n *ast.Node) {
 	// 按 LHS 类型分派
 	switch lhs.Kind {
 	case ast.NName:
+		// 闭包 capture 赋值：从栈顶（最内层）向外查
+		for i := len(c.captureStack) - 1; i >= 0; i-- {
+			sc := c.captureStack[i]
+			if cs, ok := sc.nameToSlot[lhs.Text]; ok {
+				// 赋值作为表达式时值保留在栈：Dup 后写回 capture
+				c.builder.Dup()
+				c.builder.StoreCapture(cs)
+				return
+			}
+		}
 		slot := c.localSlot(lhs.Text)
+		// 赋值作为表达式时值保留在栈：Dup 后写入 local
+		c.builder.Dup()
 		c.builder.StoreLocal(slot)
 	case ast.NMember:
 		// obj.attr = v
@@ -1147,6 +1226,9 @@ func (c *Compiler) compileAssign(n *ast.Node) {
 					c.builder.SetStatic()
 					// 赋值表达式值保留在栈（语句级 NExprStmt 的 Pop 丢弃）
 					c.builder.LoadLocal(tmpSlot)
+					// 清零临时槽（防止 GC 保守标记残留引用）
+					c.builder.PushI64(0)
+					c.builder.StoreLocal(tmpSlot)
 					return
 				}
 			}
@@ -1163,11 +1245,35 @@ func (c *Compiler) compileAssign(n *ast.Node) {
 				// 取出 rhs
 				c.builder.LoadLocal(tmpSlot)
 				c.builder.SetAttr()
+				// 清零临时槽（防止 GC 保守标记残留引用）
+				c.builder.PushI64(0)
+				c.builder.StoreLocal(tmpSlot)
 			}
 		}
 	case ast.NIndex:
 		// TODO: index assignment (arrays not supported yet)
 		c.warnf("index assignment not supported")
+		c.builder.Pop()
+	case ast.NUnary:
+		if lhs.Text == "*" {
+			// *p = v → 编译 p（指针），编译 v，OpDerefStore
+			// 栈序：[ptr_id, value] → [value]
+			// 先暂存 rhs 到临时
+			tmpSlot := c.allocTempSlot()
+			c.builder.StoreLocal(tmpSlot)
+			// 编译指针表达式
+			c.compileExpr(lhs.Children[0])
+			// 取出 rhs
+			c.builder.LoadLocal(tmpSlot)
+			c.builder.DerefStore()
+			// 赋值表达式值保留在栈（语句级 Pop 丢弃）
+			c.builder.LoadLocal(tmpSlot)
+			// 清零临时槽
+			c.builder.PushI64(0)
+			c.builder.StoreLocal(tmpSlot)
+			return
+		}
+		c.warnf("invalid unary assignment target: %s", lhs.Text)
 		c.builder.Pop()
 	default:
 		c.warnf("invalid assignment target: %s", ast.NodeKindName(lhs.Kind))
@@ -1191,6 +1297,8 @@ func (c *Compiler) compileAugAssign(n *ast.Node) {
 	c.compileExpr(rhs)
 	op := strings.TrimSuffix(n.Text, "=")
 	c.emitArithOp(op)
+	// 表达式值保留（Dup 后写回），语句级 NExprStmt/compileStmt 的 Pop 负责丢弃
+	c.builder.Dup()
 	c.builder.StoreLocal(slot)
 }
 
@@ -1222,10 +1330,18 @@ func (c *Compiler) compileExpr(n *ast.Node) {
 		// 通过 System 级内置 str_idx 获取：先 str.new 再逐字符 append
 		c.emitBuildString(idx)
 	case ast.NName:
-		// 局部变量槽查找（方法内），或顶层作用域（toplevelLocals 全局表）
+		// 查找顺序：currentLocals → captureStack（链式）→ toplevelLocals
 		if slot, ok := c.currentLocals[n.Text]; ok {
 			c.builder.LoadLocal(slot)
 			return
+		}
+		// 闭包 capture 查找：从栈顶（最内层）向外
+		for i := len(c.captureStack) - 1; i >= 0; i-- {
+			sc := c.captureStack[i]
+			if cs, ok := sc.nameToSlot[n.Text]; ok {
+				c.builder.LoadCapture(cs)
+				return
+			}
 		}
 		if c.currentLocals == nil {
 			if slot, ok := toplevelLocals[n.Text]; ok {
@@ -1281,8 +1397,16 @@ func (c *Compiler) compileExpr(n *ast.Node) {
 	case ast.NSuper:
 		c.warnf("super as expression not supported")
 		c.builder.PushI64(0)
-	case ast.NLambda, ast.NYield:
-		c.warnf("%s not implemented", ast.NodeKindName(n.Kind))
+	case ast.NLambda:
+		if n.Text == "block" {
+			c.compileLambdaBlock(n)
+		} else {
+			// 旧单表达式形式：暂不支持作为值（method 早期 lambda 仅用于系统调用占位）
+			c.warnf("lambda expression form not supported as value")
+			c.builder.PushI64(0)
+		}
+	case ast.NYield:
+		c.warnf("yield not implemented")
 		c.builder.PushI64(0)
 	default:
 		c.warnf("unsupported expression node: %s", ast.NodeKindName(n.Kind))
@@ -1325,6 +1449,24 @@ func (c *Compiler) compileBinary(n *ast.Node) {
 
 func (c *Compiler) compileUnary(n *ast.Node) {
 	op := n.Text
+	switch op {
+	case "&":
+		// &x — 取地址：将局部变量值复制到指针表，返回指针 ID
+		operand := nth(n, 0)
+		if operand.Kind == ast.NName {
+			slot := c.localSlot(operand.Text)
+			c.builder.AddrOf(slot)
+		} else {
+			c.warnf("& requires a variable name, got %s", ast.NodeKindName(operand.Kind))
+			c.builder.PushI64(0)
+		}
+		return
+	case "*":
+		// *p — 解引用：读取指针指向的值
+		c.compileExpr(nth(n, 0))
+		c.builder.DerefLoad()
+		return
+	}
 	c.compileExpr(nth(n, 0))
 	switch op {
 	case "-":
@@ -1402,6 +1544,222 @@ func (c *Compiler) emitArithOp(op string) {
 	}
 }
 
+// compileLambdaBlock —— 编译 lambda block 形式闭包表达式
+// NLambda(Text="block"): Children[0]=params(NList of NName), Children[1]=body(NBlock)
+// 闭包捕获语义：按值快照外层 local/capture 的当前值到 Closure.Captures
+func (c *Compiler) compileLambdaBlock(n *ast.Node) {
+	if len(n.Children) < 2 {
+		c.builder.PushI64(0)
+		return
+	}
+	paramsNode := n.Children[0]
+	body := n.Children[1]
+	// 收集参数名
+	var params []string
+	if paramsNode != nil {
+		for _, pn := range paramsNode.Children {
+			if pn != nil && pn.Kind == ast.NName {
+				params = append(params, pn.Text)
+			}
+		}
+	}
+	paramSet := map[string]bool{}
+	for _, pn := range params {
+		paramSet[pn] = true
+	}
+	// 收集闭包体内声明的 var 名字（这些是闭包 local，不算自由变量）
+	localNames := map[string]bool{}
+	var collectLocals func(nd *ast.Node)
+	collectLocals = func(nd *ast.Node) {
+		if nd == nil {
+			return
+		}
+		if nd.Kind == ast.NAssign && nd.Text == "var" {
+			// var X = ...：lhs 是 NName 时，X 是闭包 local
+			if len(nd.Children) >= 1 && nd.Children[0] != nil && nd.Children[0].Kind == ast.NName {
+				localNames[nd.Children[0].Text] = true
+			}
+		}
+		for _, ch := range nd.Children {
+			collectLocals(ch)
+		}
+	}
+	collectLocals(body)
+	// 收集自由变量（按出现顺序去重，排除参数和闭包 local）
+	freeVars := []string{}
+	seen := map[string]bool{}
+	var visit func(nd *ast.Node)
+	visit = func(nd *ast.Node) {
+		if nd == nil {
+			return
+		}
+		switch nd.Kind {
+		case ast.NMember:
+			// obj.attr / obj.method()：仅对象表达式参与捕获；属性/方法名是字符串不捕获
+			if len(nd.Children) > 0 {
+				visit(nd.Children[0])
+			}
+			return
+		case ast.NName:
+			if !paramSet[nd.Text] && !localNames[nd.Text] && !seen[nd.Text] {
+				seen[nd.Text] = true
+				freeVars = append(freeVars, nd.Text)
+			}
+		}
+		for _, ch := range nd.Children {
+			visit(ch)
+		}
+	}
+	visit(body)
+	// 对每个自由变量，确定 capture 来源（外层 method locals 或外层闭包 capture）
+	type capSrc struct {
+		name      string
+		source    int // 0=method locals, 1=outer closure capture
+		outerSlot uint8
+	}
+	srcs := []capSrc{}
+	localDeclared := map[string]bool{}
+	if c.currentLocals != nil {
+		for k := range c.currentLocals {
+			localDeclared[k] = true
+		}
+	}
+	for _, fv := range freeVars {
+		if localDeclared[fv] {
+			srcs = append(srcs, capSrc{name: fv, source: 0, outerSlot: c.currentLocals[fv]})
+			continue
+		}
+		// 查 captureStack（从栈顶向外）
+		found := false
+		for i := len(c.captureStack) - 1; i >= 0; i-- {
+			sc := c.captureStack[i]
+			if cs, ok := sc.nameToSlot[fv]; ok {
+				srcs = append(srcs, capSrc{name: fv, source: 1, outerSlot: cs})
+				found = true
+				break
+			}
+		}
+		if !found {
+			// 查 toplevelLocals（顶层 var）
+			if slot, ok := toplevelLocals[fv]; ok {
+				srcs = append(srcs, capSrc{name: fv, source: 0, outerSlot: slot})
+				continue
+			}
+			// 不在可见作用域：不捕获（运行时为 0）
+			c.warnf("closure cannot capture '%s' (treated as 0)", fv)
+		}
+	}
+	// 分配闭包 ID 与 entryLabel
+	closureID := c.allocClosureID()
+	entryLabel := "__cl_" + itoa(closureID)
+	// 发射 captures 压栈（按 srcs 顺序：cap0 在底）
+	for _, s := range srcs {
+		if s.source == 0 {
+			c.builder.LoadLocal(s.outerSlot)
+		} else {
+			c.builder.LoadCapture(s.outerSlot)
+		}
+	}
+	// 占位清零：未捕获的自由变量补 0
+	ncapture := uint8(len(srcs))
+	nparams := uint8(len(params))
+	// 编译期无法预知 nlocals，保守用一个上限 64（VM 用 OpLoadCapture 访问 captures，locals 只装 params + 内部 var）
+	nlocals := uint8(0)
+	c.builder.ClosureNewTo(entryLabel, nparams, nlocals, ncapture)
+	// 加入 pendingClosures
+	caps := make([]captureBinding, len(srcs))
+	for i, s := range srcs {
+		caps[i] = captureBinding{name: s.name, slot: uint8(i), outerSlot: s.outerSlot, source: s.source}
+	}
+	outerStackSnapshot := make([]*captureScope, len(c.captureStack))
+	copy(outerStackSnapshot, c.captureStack)
+	c.pendingClosures = append(c.pendingClosures, &pendingClosure{
+		entryLabel: entryLabel,
+		params:     params,
+		body:       body,
+		captures:   caps,
+		outerStack: outerStackSnapshot,
+	})
+}
+
+// allocClosureID 分配编译期闭包 ID（仅用于命名 entryLabel，与运行时 closure_id 无关）
+var globalClosureCounter int
+
+func (c *Compiler) allocClosureID() int {
+	globalClosureCounter++
+	return globalClosureCounter
+}
+
+func itoa(n int) string {
+	if n == 0 {
+		return "0"
+	}
+	neg := n < 0
+	if neg {
+		n = -n
+	}
+	var buf [20]byte
+	i := len(buf)
+	for n > 0 {
+		i--
+		buf[i] = byte('0' + n%10)
+		n /= 10
+	}
+	if neg {
+		i--
+		buf[i] = '-'
+	}
+	return string(buf[i:])
+}
+
+// compilePendingClosures —— 编译当前方法体内收集的所有闭包体
+// 在方法体末尾（PushI64(0); Ret() 之后）调用
+func (c *Compiler) compilePendingClosures() {
+	for len(c.pendingClosures) > 0 {
+		pc := c.pendingClosures[0]
+		c.pendingClosures = c.pendingClosures[1:]
+		c.compileClosureBody(pc)
+	}
+}
+
+// compileClosureBody —— 编译单个闭包体
+func (c *Compiler) compileClosureBody(pc *pendingClosure) {
+	// 保存外层上下文
+	savedLocals := c.currentLocals
+	savedNextSlot := c.nextSlot
+	savedCaptureStack := c.captureStack
+	// 建立新作用域
+	c.currentLocals = map[string]uint8{}
+	c.nextSlot = 0
+	// params → slot 0..nparams-1
+	for i, pn := range pc.params {
+		c.currentLocals[pn] = uint8(i)
+	}
+	if uint8(len(pc.params)) > c.nextSlot {
+		c.nextSlot = uint8(len(pc.params))
+	}
+	// 构建本闭包的 captureScope
+	capScope := &captureScope{nameToSlot: map[string]uint8{}}
+	for _, cb := range pc.captures {
+		capScope.nameToSlot[cb.name] = cb.slot
+	}
+	// captureStack = [本闭包 scope, ...外层快照]
+	newStack := make([]*captureScope, 0, len(pc.outerStack)+1)
+	newStack = append(newStack, capScope)
+	newStack = append(newStack, pc.outerStack...)
+	c.captureStack = newStack
+	// 编译闭包体
+	c.builder.Label(pc.entryLabel)
+	c.compileStmt(pc.body)
+	// 兜底 return 0
+	c.builder.PushI64(0)
+	c.builder.Ret()
+	// 恢复外层上下文
+	c.currentLocals = savedLocals
+	c.nextSlot = savedNextSlot
+	c.captureStack = savedCaptureStack
+}
+
 // compileCall —— 支持：
 //  1. 内置函数：system.print / system.print_char / str.new / str.append_c / str.len / str.get_c / str.delete
 //  2. 用户定义方法：NAME(args) 或 NAME.NAME(args) → 查 methodLabels
@@ -1413,6 +1771,68 @@ func (c *Compiler) compileCall(n *ast.Node) {
 	}
 	callee := n.Children[0]
 	args := n.Children[1:]
+	// 闭包立即调用：lambda(params){...}(args)
+	if callee.Kind == ast.NLambda && callee.Text == "block" {
+		for _, a := range args {
+			c.compileExpr(a)
+		}
+		c.builder.PushI64(int64(len(args)))
+		c.compileLambdaBlock(callee) // 压 closure_id（栈顶）
+		c.builder.ClosureCall()
+		return
+	}
+	// 链式调用：f()(...) 或 anyExpr()(...)——callee 是任意表达式（返回 closure_id）
+	if callee.Kind != ast.NName && callee.Kind != ast.NMember {
+		// 先编译 callee（结果 closure_id 压栈）
+		// 栈序：[arg0..argN-1, argc, closure_id]
+		// 但 callee 编译会先压 closure_id，需要调整顺序
+		// 用临时槽暂存 args 不可行（多个 args），改为：先编译 args 到栈，再编译 callee
+		for _, a := range args {
+			c.compileExpr(a)
+		}
+		c.builder.PushI64(int64(len(args)))
+		c.compileExpr(callee) // 压 closure_id（栈顶）
+		c.builder.ClosureCall()
+		return
+	}
+	// 闭包变量调用：p(args) 其中 p 是 currentLocals/capture/toplevel 中的闭包变量
+	if callee.Kind == ast.NName {
+		// currentLocals 中的变量调用（运行时按 closure_id 调用，VM 容错）
+		if slot, ok := c.currentLocals[callee.Text]; ok {
+			for _, a := range args {
+				c.compileExpr(a)
+			}
+			c.builder.PushI64(int64(len(args)))
+			c.builder.LoadLocal(slot)
+			c.builder.ClosureCall()
+			return
+		}
+		// 闭包 capture 中的变量调用
+		for i := len(c.captureStack) - 1; i >= 0; i-- {
+			sc := c.captureStack[i]
+			if cs, ok := sc.nameToSlot[callee.Text]; ok {
+				for _, a := range args {
+					c.compileExpr(a)
+				}
+				c.builder.PushI64(int64(len(args)))
+				c.builder.LoadCapture(cs)
+				c.builder.ClosureCall()
+				return
+			}
+		}
+		// 顶层 var 中的闭包变量调用（仅当 currentLocals == nil，即顶层代码）
+		if c.currentLocals == nil {
+			if slot, ok := toplevelLocals[callee.Text]; ok {
+				for _, a := range args {
+					c.compileExpr(a)
+				}
+				c.builder.PushI64(int64(len(args)))
+				c.builder.LoadLocal(slot)
+				c.builder.ClosureCall()
+				return
+			}
+		}
+	}
 	// 内置函数识别
 	if callee.Kind == ast.NName {
 		if c.tryCompileBuiltin(callee.Text, args) {
@@ -1594,6 +2014,10 @@ func (c *Compiler) tryCompileBuiltin(name string, args []*ast.Node) bool {
 		c.builder.ListPush()
 		c.builder.Swap()
 		c.builder.ListPush()
+		return true
+	case "system.gc":
+		// 手动触发 GC，返回回收的对象数
+		c.builder.GC()
 		return true
 	case "str.new", "str_new":
 		c.builder.StrNew()
@@ -1994,6 +2418,8 @@ func (c *Compiler) compileMethodBody(m *methodInfo) {
 	// 方法无 return 时兜底：返回 0
 	c.builder.PushI64(0)
 	c.builder.Ret()
+	// 编译方法体内收集的闭包体
+	c.compilePendingClosures()
 	c.insideMethod = false
 	c.leaveMethodScope()
 	// 注册 export
@@ -2030,6 +2456,8 @@ func (c *Compiler) compileClassMethodBody(cl *classInfo, m *classMethod) {
 	}
 	c.builder.PushI64(0)
 	c.builder.Ret()
+	// 编译类方法体内收集的闭包体
+	c.compilePendingClosures()
 	m.numLocals = c.nextSlot
 	if m.numLocals < 8 {
 		m.numLocals = 8
@@ -2047,6 +2475,8 @@ func (c *Compiler) enterMethodScope() {
 func (c *Compiler) leaveMethodScope() {
 	c.currentLocals = nil
 	c.nextSlot = 0
+	c.pendingClosures = nil
+	c.captureStack = nil
 }
 
 func (c *Compiler) localSlot(name string) uint8 {

@@ -136,6 +136,20 @@ const (
 	OpPopHandler  Op = 0x96 // 弹出 handler（try 体正常结束）
 	OpRaise       Op = 0x97 // [msg_str_idx] → 抛出异常；无 handler 则硬错误
 
+	// GC 垃圾回收
+	OpGC Op = 0x98 // [] → [freed_count]；手动触发一次标记-清扫 GC，返回回收的对象数
+
+	// 指针操作（ref-cell 模型：&x 取地址创建引用单元格，*p 解引用读写）
+	OpAddrOf     Op = 0x99 // u8 slot → [ptr_id]；将局部变量值复制到指针表，返回指针 ID
+	OpDerefLoad  Op = 0x9A // [ptr_id] → [value]；读取指针指向的值
+	OpDerefStore Op = 0x9B // [ptr_id, value] → [value]；写入指针指向的位置，返回写入值
+
+	// 闭包操作（lambda block 形式：捕获外层 local 值的快照）
+	OpClosureNew   Op = 0x53 // i32 entryPC, u8 nparams, u8 nlocals, u8 ncapture → [cap0..capN-1] → [closure_id]
+	OpClosureCall  Op = 0x54 // [arg0..argM-1, argc, closure_id] → 调用，结果留在栈顶
+	OpLoadCapture  Op = 0x55 // u8 slot → [captured_value]
+	OpStoreCapture Op = 0x56 // u8 slot → [v] → []
+
 	OpHalt Op = 0xFF
 )
 
@@ -310,6 +324,22 @@ func OpName(op Op) string {
 		return "PopHandler"
 	case OpRaise:
 		return "Raise"
+	case OpGC:
+		return "GC"
+	case OpAddrOf:
+		return "AddrOf"
+	case OpDerefLoad:
+		return "DerefLoad"
+	case OpDerefStore:
+		return "DerefStore"
+	case OpClosureNew:
+		return "ClosureNew"
+	case OpClosureCall:
+		return "ClosureCall"
+	case OpLoadCapture:
+		return "LoadCapture"
+	case OpStoreCapture:
+		return "StoreCapture"
 	case OpHalt:
 		return "Halt"
 	}
@@ -360,8 +390,18 @@ func InstructionSize(op Op) int {
 		return 1
 	case OpPushHandler:
 		return 1 + 4
-	case OpPopHandler, OpRaise:
+	case OpPopHandler, OpRaise, OpGC, OpDerefLoad:
 		return 1
+	case OpAddrOf:
+		return 1 + 1 // opcode + u8 slot
+	case OpDerefStore:
+		return 1
+	case OpClosureNew:
+		return 1 + 4 + 1 + 1 + 1 // opcode + i32 entryPC + u8 nparams + u8 nlocals + u8 ncapture
+	case OpClosureCall:
+		return 1
+	case OpLoadCapture, OpStoreCapture:
+		return 1 + 1 // opcode + u8 slot
 	case OpHalt:
 		return 1
 	}
