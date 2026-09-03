@@ -290,6 +290,22 @@ func (b *Builder) ClosureNewTo(name string, nparams, nlocals, ncapture uint8) {
 func (b *Builder) ClosureCall()            { b.emit(bytecode.OpClosureCall) }
 func (b *Builder) LoadCapture(slot uint8)  { b.emit(bytecode.OpLoadCapture); b.emitU8(slot) }
 func (b *Builder) StoreCapture(slot uint8) { b.emit(bytecode.OpStoreCapture); b.emitU8(slot) }
+
+// DeferPushTo 生成 OpDeferPush（entryPC 为绝对偏移，前向标签用 closureRefs 回填）
+// 布局：[op][i32 entryPC][u8 argc][u8 ncapture][u8 isClosure]
+func (b *Builder) DeferPushTo(name string, argc, ncapture, isClosure uint8) {
+	b.emit(bytecode.OpDeferPush)
+	at := len(b.code) // entryPC 占位位置
+	b.emitI32(0)
+	b.emitU8(argc)
+	b.emitU8(ncapture)
+	b.emitU8(isClosure)
+	if off, ok := b.labels[name]; ok {
+		b.patchOffset(at, int32(off))
+		return
+	}
+	b.closureRefs[name] = append(b.closureRefs[name], at)
+}
 func (b *Builder) Raise()                  { b.emit(bytecode.OpRaise) }
 
 func (b *Builder) SetMethodBlockStart(off uint32) { b.methodBlockStart = off }
@@ -942,6 +958,11 @@ func (c *Compiler) compileStmt(n *ast.Node) {
 				c.builder.Pop()
 			}
 		}
+	case ast.NDefer:
+		// defer call; Children[0] = 被延迟的调用
+		if len(n.Children) >= 1 {
+			c.compileDefer(n.Children[0])
+		}
 	case ast.NGo:
 		c.compileGoStmt(n)
 	case ast.NAssign:
@@ -994,6 +1015,54 @@ func (c *Compiler) compileGoStmt(n *ast.Node) {
 	c.builder.PushI64(int64(midx))
 	c.builder.Go()
 	// go 语句无返回值，不压占位（compileStmt 的 NGo 分支不做语句尾 Pop）
+}
+
+// compileDefer 编译 defer 语句（Go 语义）：
+//
+//	defer methodName(args);          → OpDeferPush(entryPC, argc, 0, 0)
+//	defer lambda(params){...}(args); → 立即创建闭包，OpDeferPush(entryPC, argc, 0, 1)
+//
+// 参数立即求值并快照；函数体延迟到本帧返回/异常展开时按 LIFO 执行。
+func (c *Compiler) compileDefer(call *ast.Node) {
+	if call == nil || call.Kind != ast.NCall || len(call.Children) < 1 {
+		c.warnf("defer requires a call expression")
+		return
+	}
+	callee := call.Children[0]
+	args := call.Children[1:]
+	// defer lambda(params){...}(args)
+	if callee.Kind == ast.NLambda && callee.Text == "block" {
+		for _, a := range args {
+			c.compileExpr(a)
+		}
+		label := c.compileLambdaBlock(callee) // 立即求值捕获 → 压 closure_id
+		if label == "" {
+			for range args {
+				c.builder.Pop()
+			}
+			return
+		}
+		c.builder.DeferPushTo(label, uint8(len(args)), 0, 1)
+		return
+	}
+	// defer methodName(args)
+	if callee.Kind == ast.NName {
+		if label, ok := c.methodLabels[callee.Text]; ok {
+			for _, a := range args {
+				c.compileExpr(a)
+			}
+			c.builder.DeferPushTo(label, uint8(len(args)), 0, 0)
+			return
+		}
+	}
+	c.warnf("defer only supports top-level method call or lambda(...){...}(...) (got %s)",
+		ast.NodeKindName(callee.Kind))
+	for _, a := range args {
+		c.compileExpr(a)
+	}
+	for range args {
+		c.builder.Pop()
+	}
 }
 
 // compileRaise 编译 raise 语句：
@@ -1735,10 +1804,11 @@ func (c *Compiler) emitArithOp(op string) {
 // compileLambdaBlock —— 编译 lambda block 形式闭包表达式
 // NLambda(Text="block"): Children[0]=params(NList of NName), Children[1]=body(NBlock)
 // 闭包捕获语义：按值快照外层 local/capture 的当前值到 Closure.Captures
-func (c *Compiler) compileLambdaBlock(n *ast.Node) {
+// 返回闭包体 entryLabel（供 defer/立即调用等引用；失败返回空串）
+func (c *Compiler) compileLambdaBlock(n *ast.Node) string {
 	if len(n.Children) < 2 {
 		c.builder.PushI64(0)
-		return
+		return ""
 	}
 	paramsNode := n.Children[0]
 	body := n.Children[1]
@@ -1789,6 +1859,10 @@ func (c *Compiler) compileLambdaBlock(n *ast.Node) {
 			}
 			return
 		case ast.NName:
+			// 方法名（顶层/类方法）不是自由变量：调用点经 methodLabels 解析
+			if _, isMethod := c.methodLabels[nd.Text]; isMethod {
+				break
+			}
 			if !paramSet[nd.Text] && !localNames[nd.Text] && !seen[nd.Text] {
 				seen[nd.Text] = true
 				freeVars = append(freeVars, nd.Text)
@@ -1869,6 +1943,7 @@ func (c *Compiler) compileLambdaBlock(n *ast.Node) {
 		outerStack: outerStackSnapshot,
 		retN:       lambdaRetCount(body),
 	})
+	return entryLabel
 }
 
 // lambdaRetCount 统计一个闭包体（NBlock）内最大 return 值个数：

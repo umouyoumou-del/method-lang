@@ -83,6 +83,9 @@ const (
 	TInstanceof
 	TVar
 	TGo
+	// Go 风格集成关键字
+	TDefer
+	TRange
 
 	// 多字符运算符
 	TEq      // ==
@@ -169,6 +172,8 @@ var keywordTable = map[string]TokenKind{
 	"instanceof": TInstanceof,
 	"var":        TVar,
 	"go":         TGo,
+	"defer":      TDefer,
+	"range":      TRange,
 }
 
 // New 创建词法分析器

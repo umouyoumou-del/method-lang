@@ -109,6 +109,17 @@ type Closure struct {
 	RefCount int32
 }
 
+// deferRecord —— 一次 defer 记录（Go 语义：参数/闭包立即求值，函数体延迟执行）
+type deferRecord struct {
+	entryPC   int32   // 延迟函数入口（绝对偏移）
+	argc      uint8   // 实参个数
+	ncapture  uint8   // 捕获值个数（本实现走 closure 对象，恒 0）
+	isClosure bool    // true = 以闭包方式调用（frames[top].closureID = closureID）
+	closureID int64   // isClosure 时有效（>=1），否则 -1
+	args      []int64 // 立即求值的实参快照
+	framesLen int     // 记录 defer 时帧深度：仅在该帧返回/展开时执行
+}
+
 type ClassRegistry struct {
 	classes    []ClassMeta
 	nameToID   map[string]int32
@@ -384,6 +395,8 @@ type Interpreter struct {
 	// 闭包表（lambda block 形式：捕获外层 local 值的快照）
 	closures    []Closure
 	closureFree []int32
+	// defer 延迟调用记录（帧级回调，方法返回/异常展开时 LIFO 执行）
+	defers []deferRecord
 	// HTTP 全局配置
 	httpClient  *http.Client
 	httpUA      string
@@ -568,17 +581,20 @@ func (vm *Interpreter) Run(prog *bytecode.Program) (Status, error) {
 	return vm.runCode(prog, 0)
 }
 
-// runCode 从 startPC 开始执行字节码主循环。
-//
-// 根线程（isRoot）在退出前（无论正常/异常路径）等待全部 go 子线程结束；
-// go 子线程由 opGo 创建，方法体 Ret 时 callStack 为空即自然结束。
-func (vm *Interpreter) runCode(prog *bytecode.Program, startPC int) (st Status, err error) {
+// runCode 从 startPC 开始执行字节码主循环（顶层包装：退出时等待 go 子线程）。
+func (vm *Interpreter) runCode(prog *bytecode.Program, startPC int) (Status, error) {
 	defer func() {
 		// 根线程退出时等待所有子线程（子线程的输出/通道操作全部完成）
 		if vm.isRoot && vm.Shared != nil {
 			vm.Shared.wg.Wait()
 		}
 	}()
+	return vm.runCodeInner(prog, startPC)
+}
+
+// runCodeInner 执行主循环。runDefers 会以嵌套方式调用它来运行延迟体，
+// 此时不应再次触发 wg.Wait（避免与根线程的等待逻辑叠加）。
+func (vm *Interpreter) runCodeInner(prog *bytecode.Program, startPC int) (st Status, err error) {
 	code := prog.Code
 	pc := startPC
 	steps := int64(0)
@@ -600,6 +616,10 @@ func (vm *Interpreter) runCode(prog *bytecode.Program, startPC int) (st Status, 
 		switch op {
 		case bytecode.OpNop:
 		case bytecode.OpHalt:
+			// 程序正常结束前执行深度 0 的 defer（Go 语义：main 返回前运行）
+			if st, err := vm.runDefers(0); st != StatusOk {
+				return st, err
+			}
 			return StatusOk, nil
 		case bytecode.OpPushI64:
 			v, np, err := readI64(code, pc)
@@ -1249,6 +1269,53 @@ func (vm *Interpreter) runCode(prog *bytecode.Program, startPC int) (st Status, 
 				}
 			}
 
+		// ===== defer 延迟调用 =====
+		case bytecode.OpDeferPush:
+			// 布局：[op][i32 entryPC][u8 argc][u8 ncapture][u8 isClosure]
+			// 栈序（底→顶）：[arg0..argN-1, cap0..capM-1(若), closure_id(若 isClosure)]
+			if pc+4+3 > len(code) {
+				return StatusTruncated, nil
+			}
+			entryPC := int32(binary.LittleEndian.Uint32(code[pc : pc+4]))
+			pc += 4
+			argc := code[pc]
+			pc++
+			ncapture := code[pc]
+			pc++
+			isClosure := code[pc]
+			pc++
+			var cid int64 = -1
+			if isClosure != 0 {
+				v, err := vm.pop()
+				if err != nil {
+					return StatusStackUnderflow, err
+				}
+				cid = v
+			}
+			// 捕获值（本编译策略闭包已内建，仅作栈平衡处理）
+			for i := uint8(0); i < ncapture; i++ {
+				if _, err := vm.pop(); err != nil {
+					return StatusStackUnderflow, err
+				}
+			}
+			args := make([]int64, argc)
+			for i := int(argc) - 1; i >= 0; i-- {
+				v, err := vm.pop()
+				if err != nil {
+					return StatusStackUnderflow, err
+				}
+				args[i] = v
+			}
+			vm.defers = append(vm.defers, deferRecord{
+				entryPC:   entryPC,
+				argc:      argc,
+				ncapture:  ncapture,
+				isClosure: isClosure != 0,
+				closureID: cid,
+				args:      args,
+				framesLen: len(vm.frames),
+			})
+
 		// ===== 列表容器 =====
 		case bytecode.OpListNew:
 			id, err := vm.listAlloc()
@@ -1791,9 +1858,30 @@ func (vm *Interpreter) opReturnN(code []byte, pc *int, retN int) (Status, error)
 	if len(vm.frames) > 0 {
 		pending = vm.frames[len(vm.frames)-1].pendingNewObj
 	}
+	// Go 语义：方法返回时先执行本帧的 defer（LIFO）
+	if len(vm.frames) > 0 {
+		csBefore := len(vm.callStack)
+		frBefore := len(vm.frames)
+		st, err := vm.runDefers(len(vm.frames))
+		if st != StatusOk {
+			return st, err
+		}
+		// defer 内 raise 被外层 handler 处理后，控制权已移交嵌套 runCode：
+		// 本帧的返回路径作废，直接结束外层主循环，避免重复执行后续代码
+		if len(vm.callStack) < csBefore || len(vm.frames) < frBefore {
+			*pc = len(code)
+			return StatusOk, nil
+		}
+	}
 	vm.restoreFrame()
 	if len(vm.callStack) == 0 {
-		// 顶层 return → 退出
+		// 顶层 return（根线程或 go 子线程）：深度 0 的 defer 也应执行
+		st, err := vm.runDefers(0)
+		if st != StatusOk {
+			return st, err
+		}
+		// 顶层 return → 退出主循环
+		*pc = len(code)
 		return StatusOk, nil
 	}
 	top := len(vm.callStack) - 1
@@ -1806,6 +1894,68 @@ func (vm *Interpreter) opReturnN(code []byte, pc *int, retN int) (Status, error)
 			vm.push(rets[i])
 		}
 	}
+	return StatusOk, nil
+}
+
+// runAllDefers —— 从最深帧到深度 0 依次执行剩余 defer（供 OpHalt 前清场）
+func (vm *Interpreter) runAllDefers() (Status, error) {
+	for depth := len(vm.frames); depth >= 0; depth-- {
+		st, err := vm.runDefers(depth)
+		if st != StatusOk {
+			return st, err
+		}
+	}
+	return StatusOk, nil
+}
+
+// runDefers —— 执行帧深度 == framesLen 的所有待运行 defer（LIFO）。
+// 返回非 OK 表示 defer 内 raise 未被本层及外层 handler 捕获。
+func (vm *Interpreter) runDefers(framesLen int) (Status, error) {
+	for i := len(vm.defers) - 1; i >= 0; i-- {
+		if vm.defers[i].framesLen != framesLen {
+			continue
+		}
+		d := vm.defers[i]
+		vm.defers = append(vm.defers[:i], vm.defers[i+1:]...)
+		st, err := vm.runDefer(&d)
+		if st != StatusOk {
+			return st, err
+		}
+	}
+	return StatusOk, nil
+}
+
+// runDefer —— 在嵌套 runCode 中执行单个延迟函数体。
+// 采用「callStack 哨兵 = len(code)」：延迟体 Ret 时弹出哨兵使 pc 越过代码末尾，
+// 嵌套 runCode 自然结束，随后丢弃其返回值。
+func (vm *Interpreter) runDefer(d *deferRecord) (Status, error) {
+	if vm.prog == nil {
+		return StatusOk, nil
+	}
+	if d.isClosure {
+		cid := int32(d.closureID)
+		if cid <= 0 || int(cid) >= len(vm.closures) || vm.closures[cid].RefCount <= 0 {
+			// 闭包已被回收（理论上 defers 持有根引用，不应发生）：当作空操作
+			return StatusOk, nil
+		}
+	}
+	vm.saveFrame()
+	if d.isClosure {
+		vm.frames[len(vm.frames)-1].closureID = int32(d.closureID)
+	} else {
+		vm.frames[len(vm.frames)-1].closureID = -1
+	}
+	for i := 0; i < int(d.argc) && i < 256; i++ {
+		vm.locals[i] = d.args[i]
+	}
+	sentinel := len(vm.prog.Code)
+	vm.callStack = append(vm.callStack, sentinel)
+	st, err := vm.runCodeInner(vm.prog, int(d.entryPC))
+	if st != StatusOk {
+		return st, err
+	}
+	// 丢弃延迟体产生的返回值
+	vm.popNo()
 	return StatusOk, nil
 }
 
@@ -1826,10 +1976,16 @@ func (vm *Interpreter) throwException(msg string) (int, bool) {
 	}
 	h := vm.handlers[len(vm.handlers)-1]
 	vm.handlers = vm.handlers[:len(vm.handlers)-1]
-	if len(vm.frames) > h.framesLen {
-		copy(vm.locals[0:256], vm.frames[h.framesLen].saved[:])
+	// Go 语义：异常展开时，被抛弃的每一层调用帧的 defer 都要先执行（由内向外）
+	for len(vm.frames) > h.framesLen {
+		st, err := vm.runDefers(len(vm.frames))
+		if st != StatusOk {
+			// defer 内 raise 且未被捕获：交由更外层逻辑处理（此处返回无 handler 信号）
+			return 0, false
+		}
+		_ = err
+		vm.restoreFrame()
 	}
-	vm.frames = vm.frames[:h.framesLen]
 	vm.callStack = vm.callStack[:h.csLen]
 	vm.sp = h.sp
 	idx := vm.strIntern(msg)
@@ -2098,6 +2254,15 @@ func (vm *Interpreter) gcRun() int {
 		}
 		if f.closureID >= 0 {
 			vm.gcMarkValue(int64(f.closureID))
+		}
+	}
+	// 根 3.5: defer 记录（延迟函数实参快照 + 闭包引用）
+	for _, d := range vm.defers {
+		for _, a := range d.args {
+			vm.gcMarkValue(a)
+		}
+		if d.isClosure {
+			vm.gcMarkValue(d.closureID)
 		}
 	}
 	// 根 4: 静态字段

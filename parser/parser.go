@@ -233,6 +233,10 @@ func tokenName(k lexer.TokenKind) string {
 		return "var"
 	case lexer.TGo:
 		return "go"
+	case lexer.TDefer:
+		return "defer"
+	case lexer.TRange:
+		return "range"
 	case lexer.TEq:
 		return "'=='"
 	case lexer.TNe:
@@ -318,6 +322,8 @@ func (p *Parser) parseStmt() *ast.Node {
 		return p.parseVarDecl()
 	case lexer.TGo:
 		return p.parseGoStmt()
+	case lexer.TDefer:
+		return p.parseDefer()
 	case lexer.TRaise:
 		return p.parseRaise()
 	case lexer.TAssert:
@@ -1080,6 +1086,30 @@ func (p *Parser) parseGoStmt() *ast.Node {
 	}
 	p.advance()
 	n.Add(args)
+	p.acceptRune(';')
+	return n
+}
+
+// parseDefer 解析 defer 语句：
+//
+//	defer methodName(args);
+//	defer lambda(v) { ... }(arg);
+//	defer lambda { ... };
+//
+// 生成 NDefer 节点：Children[0] = 被延迟的调用表达式（NCall）。
+func (p *Parser) parseDefer() *ast.Node {
+	line := p.line()
+	p.advance() // 'defer'
+	n := ast.New(ast.NDefer, "", line)
+	e := p.parseExpr()
+	if e == nil {
+		return n
+	}
+	if e.Kind != ast.NCall {
+		p.errorf("defer requires a call expression")
+		return n
+	}
+	n.Add(e)
 	p.acceptRune(';')
 	return n
 }
