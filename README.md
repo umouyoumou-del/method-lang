@@ -105,6 +105,50 @@ x = 1 and 0;   // 0
 y = 0 or 1;    // 1
 ```
 
+### Go 风格特性（v2）
+
+**闭包 / 匿名函数**（复用 `lambda`，无 `func` 关键字）：
+
+```
+var add = lambda(a, b) { return a + b; };   // block 形式
+var sq  = lambda(x) { return x * x; };
+add(3, 4);          // 7
+sq(5);              // 25
+```
+
+捕获语义为**按值快照**：闭包创建时把外层变量当前值复制进闭包；需要可变共享时使用指针（`&x` / `*p`）。
+
+**多返回值 + error 模式**：
+
+```
+method divmod(a, b) (int, int) { return a / b, a % b; }
+var q, r = divmod(17, 5);       // q=3, r=2
+var only = divmod(10, 3);       // 单接收取第一个：3
+divmod(10, 3);                  // 语句级丢弃
+
+method parse_int(s) (int, str) { ... return v, ""; ... return 0, s; }
+var v, err = parse_int("42");
+```
+
+**defer 延迟调用**（参数立即求值，函数体在帧返回/异常展开时按 LIFO 执行）：
+
+```
+defer methodName(args);
+defer lambda(v) { ... }(v);
+```
+
+**slice / range**：slice 复用 list（动态数组），带 Go 风格 API 别名：
+
+```
+var s = slice.new();
+slice.append(s, 1);
+for k, v in range s { ... }         // list: k=index, v=value
+for k, v in range dict_var { ... }  // dict: k=str_idx key, v=value（迭代顺序不确定，与 Go 一致）
+for c in range "Hi你" { ... }        // str: 按 rune 迭代
+```
+
+> 注：dict 迭代顺序与 Go 一样是非确定的；list/dict/str 之外的对象默认按 list 模板迭代。
+
 ## 内置函数
 
 | 类别 | 函数 |
